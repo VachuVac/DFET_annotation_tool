@@ -77,12 +77,12 @@ def draw_coco_polygons(
     categories_by_id,
     visible_by_category,
     show_points: bool,
-    opacity: float = 0.15,
+    opacity: float = 0.30,
 ) -> tuple[np.ndarray, list]:
     """Draw polygon annotations on image.
     
     Args:
-        opacity: Fill opacity (0.0-1.0), default 0.15
+        opacity: Fill opacity (0.0-1.0), default 0.30
     """
     rendered_image = image.copy()
     overlay = rendered_image.copy()
@@ -134,12 +134,12 @@ def draw_coco_bboxes(
     annotations,
     categories_by_id,
     visible_by_category,
-    opacity: float = 0.15,
+    opacity: float = 0.30,
 ) -> tuple[np.ndarray, list]:
     """Draw bounding box annotations on image.
     
     Args:
-        opacity: Fill opacity (0.0-1.0), default 0.15
+        opacity: Fill opacity (0.0-1.0), default 0.30
     """
     rendered_image = image.copy()
     overlay = rendered_image.copy()

@@ -65,6 +65,12 @@ def polygon_centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
     return total_x / count, total_y / count
 
 
+def resource_path(*parts: str) -> Path:
+    """Resolve a bundled resource path in both source and frozen runs."""
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_path.joinpath(*parts)
+
+
 class ImageCanvas(QWidget):
     """Image viewport widget with pan/zoom and Qt-native annotation overlays."""
 
@@ -80,7 +86,7 @@ class ImageCanvas(QWidget):
         self._overlay_items: list[dict] = []
         self.show_points = False
         self.show_labels = True
-        self.annotation_opacity = 0.15
+        self.annotation_opacity = 0.30
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -499,7 +505,7 @@ class PyQtAnnotationReview(QMainWindow):
         opacity_row.addWidget(opacity_label)
         self.opacity_input = QSpinBox()
         self.opacity_input.setRange(0, 100)
-        self.opacity_input.setValue(15)
+        self.opacity_input.setValue(30)
         self.opacity_input.valueChanged.connect(self._on_overlay_setting_changed)
         opacity_row.addWidget(self.opacity_input)
         sidebar_layout.addLayout(opacity_row)
@@ -563,7 +569,7 @@ class PyQtAnnotationReview(QMainWindow):
     def _apply_styles(self) -> None:
         base_font_size = max(10, int(round(10 * DPI_SCALE)))
         header_size = max(14, int(round(14 * DPI_SCALE)))
-        checkmark_path = (Path(__file__).resolve().parent / "assets" / "checkbox_checked.svg").as_posix()
+        checkmark_path = resource_path("assets", "checkbox_checked.svg").as_posix()
         self.setStyleSheet(
             f"""
             QWidget {{

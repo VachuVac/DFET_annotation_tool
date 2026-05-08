@@ -44,7 +44,7 @@ class AnnotationViewer:
         self.pending_action = None
         self.raise_window_requested = False
 
-        self.opacity = 0.15
+        self.opacity = 0.30
         self.opacity_input_hitbox = None
         self.opacity_input_active = False
         self.opacity_input_buffer = ""

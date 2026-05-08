@@ -5,7 +5,7 @@ a = Analysis(
     ['review.py'],
     pathex=['src'],
     binaries=[('<USER_HOME>/.conda/envs/review/Library/bin/libssl-3-x64.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libcrypto-3-x64.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libexpat.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libmpdec-4.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/zstd.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/liblzma.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libbz2.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/ffi.dll', '.')],
-    datas=[],
+    datas=[('src/assets/checkbox_checked.svg', 'assets')],
     hiddenimports=['src.constants', 'src.utils', 'src.data_loading', 'src.qt_main'],
     hookspath=[],
     hooksconfig={},
