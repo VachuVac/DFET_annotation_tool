@@ -1,0 +1,2 @@
+cd <repo>
+powershell -ExecutionPolicy Bypass -File .\build_review_app.ps1
