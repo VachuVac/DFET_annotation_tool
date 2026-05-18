@@ -14,6 +14,7 @@ from .utils import parse_arguments
 try:
     from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt
     from PyQt6.QtGui import (
+        QClipboard,
         QColor,
         QFont,
         QImage,
@@ -478,9 +479,18 @@ class PyQtAnnotationReview(QMainWindow):
         self.image_status.setWordWrap(True)
         status_layout.addWidget(self.image_status)
 
+        # Zoom and copy button row
+        zoom_copy_row = QHBoxLayout()
         self.zoom_status = QLabel("Zoom: 100%")
         self.zoom_status.setObjectName("statSecondary")
-        status_layout.addWidget(self.zoom_status)
+        zoom_copy_row.addWidget(self.zoom_status)
+        zoom_copy_row.addStretch()
+        self.copy_id_button = QPushButton("Copy ID")
+        self.copy_id_button.setObjectName("copyIdButton")
+        self.copy_id_button.setMaximumWidth(80)
+        self.copy_id_button.clicked.connect(self._copy_image_id)
+        zoom_copy_row.addWidget(self.copy_id_button)
+        status_layout.addLayout(zoom_copy_row)
 
         sidebar_layout.addWidget(self.status_card)
 
@@ -732,6 +742,27 @@ class PyQtAnnotationReview(QMainWindow):
         except OSError:
             pass
 
+    def _copy_image_id(self) -> None:
+        """Copy the last 9 characters of the image filename (without extension) to clipboard."""
+        if not self.current_image_name:
+            return
+        
+        basename = os.path.basename(self.current_image_name)
+        # Remove file extension
+        name_without_ext = os.path.splitext(basename)[0]
+        # Get last 9 characters
+        image_id = name_without_ext[-9:] if len(name_without_ext) >= 9 else name_without_ext
+        
+        # Copy to clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(image_id)
+        
+        # Optional: Show brief confirmation
+        self.copy_id_button.setText("Copied!")
+        # Reset button text after 1.5 seconds
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(1500, lambda: self.copy_id_button.setText("Copy ID") if self.copy_id_button else None)
+
     def _open_folder(self) -> None:
         initial_directory = self.last_opened_directory or str(Path.cwd())
         selected_file, _ = QFileDialog.getOpenFileName(
@@ -806,6 +837,7 @@ class PyQtAnnotationReview(QMainWindow):
                 bubble.blockSignals(True)
                 bubble.setChecked(True)
                 bubble.blockSignals(False)
+                bubble._refresh_style()  # Manually refresh visual style
         self._refresh_overlay_items()
 
     def _hide_all_classes(self) -> None:
@@ -816,6 +848,7 @@ class PyQtAnnotationReview(QMainWindow):
                 bubble.blockSignals(True)
                 bubble.setChecked(False)
                 bubble.blockSignals(False)
+                bubble._refresh_style()  # Manually refresh visual style
         self._refresh_overlay_items()
 
     def _sync_canvas_state(self) -> None:
@@ -956,6 +989,11 @@ class PyQtAnnotationReview(QMainWindow):
         current_class_items.sort(key=lambda item: str(item[1]).lower())
         self.current_category_ids = current_category_ids
         self.current_class_items = current_class_items
+        
+        # Reset visibility for all current classes to True (show all by default)
+        for category_id in self.current_category_ids:
+            self.visible_by_category[category_id] = True
+        
         self.current_overlay_items = self._build_overlay_items(self.current_annotations)
 
         title = f"{self.index + 1}/{len(self.images)} - {os.path.basename(self.current_image_name)}"
@@ -977,8 +1015,10 @@ class PyQtAnnotationReview(QMainWindow):
             self.dataset_status.setText("No dataset loaded")
             self.image_status.setText("Open a dataset to begin")
             self.zoom_status.setText("Zoom: 100%")
+            self.copy_id_button.setEnabled(False)
             return
 
+        self.copy_id_button.setEnabled(True)
         self.dataset_status.setText(f"{len(self.images)} images • {len(self.class_items)} classes")
 
         if self.images:
