@@ -5,7 +5,12 @@ a = Analysis(
     ['review.py'],
     pathex=['src'],
     binaries=[('<USER_HOME>/.conda/envs/review/Library/bin/libssl-3-x64.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libcrypto-3-x64.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libexpat.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libmpdec-4.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/zstd.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/liblzma.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/libbz2.dll', '.'), ('<USER_HOME>/.conda/envs/review/Library/bin/ffi.dll', '.')],
-    datas=[('src/assets/checkbox_checked.svg', 'assets')],
+    datas=[
+        ('src/assets/checkbox_checked.svg', 'assets'),
+        ('src/assets/edit_icon.svg', 'assets'),
+        ('src/class_colors.json', '.'),
+        ('src/class_colors_default.json', '.'),
+    ],
     hiddenimports=['src.constants', 'src.utils', 'src.data_loading', 'src.qt_main'],
     hookspath=[],
     hooksconfig={},

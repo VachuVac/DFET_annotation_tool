@@ -17,6 +17,8 @@ What agents should know (concise)
 - **Features**: COCO annotation viewer with opacity control, zoom/pan, class filtering, visibility toggling
 - **Build**: PyInstaller with spec file (`review_app.spec`) → standalone `review_app.exe` under `build/review_app/`
 - **Workflow**: Quick checks with `python review.py`; build with `build_review_app.ps1` or `build_command.txt`
+- **File placement rule**: Any new file that is part of the source code or is loaded by the application at runtime (config files, assets, data files) must live inside the `src/` folder. Only project-level meta files (spec, build scripts, documentation) belong at the repo root.
+- **Distribution model**: The app is always distributed as a single `review_app.exe` built with PyInstaller (`review_app.spec`, one-file mode). Every new runtime file (asset, config, icon, etc.) must be added to the `datas` list in `review_app.spec` or it will be missing for end users. Static assets (SVGs, images) go to their subfolder (e.g. `'assets'`); user-editable configs go to `'.'` so they land in `_MEIPASS` and can be seeded next to the exe on first run via `_ensure_color_config_files()`. Never assume a file will exist on the user's machine — bundle it or generate it at startup.
 
 Common pitfalls and checks
 -------------------------
