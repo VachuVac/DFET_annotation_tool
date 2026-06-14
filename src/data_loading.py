@@ -1,5 +1,6 @@
 """Data loading functions for COCO annotations."""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -7,6 +8,8 @@ import zipfile
 from collections import defaultdict
 from pathlib import Path
 import shutil
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def find_coco_paths(search_root: str) -> tuple[str, str]:
@@ -84,11 +87,19 @@ def resolve_dataset_paths(input_path: str | None) -> tuple[str, str, tempfile.Te
     raise ValueError("Input must be a .zip file or a directory containing COCO export files.")
 
 
-def load_coco_data(annotations_path: str):
-    """Load COCO data from JSON file."""
-    with open(annotations_path, "r", encoding="utf-8") as file_handle:
-        coco_data = json.load(file_handle)
+def stable_image_id(file_name: str) -> int:
+    """Deterministic COCO image id from the last 9 chars of the filename stem.
 
+    Mirrors the id used by the prediction pipeline so a results/predictions file
+    (which only carries integer image_ids) can be matched back to image files.
+    """
+    photo_id = Path(file_name).stem[-9:]
+    digest = hashlib.md5(photo_id.encode()).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def _parse_coco_dict(coco_data: dict):
+    """Parse a standard COCO dict (images/annotations/categories)."""
     images = coco_data.get("images", [])
     images_by_id = {image["id"]: image for image in images}
     annotations_by_image_id = defaultdict(list)
@@ -103,11 +114,63 @@ def load_coco_data(annotations_path: str):
     return images, images_by_id, annotations_by_image_id, categories_by_id
 
 
+def _parse_coco_results(annotations_list: list, images_path: str):
+    """Rebuild dataset metadata from a COCO results/predictions list.
+
+    Such files are a flat list of annotations with integer image_ids but no
+    images or categories. Image filenames are recovered from the folder via
+    stable_image_id; category names fall back to the numeric id.
+    """
+    image_files = sorted(
+        entry.name
+        for entry in os.scandir(images_path)
+        if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS
+    )
+    images = [{"id": stable_image_id(name), "file_name": name} for name in image_files]
+    images_by_id = {image["id"]: image for image in images}
+
+    annotations_by_image_id = defaultdict(list)
+    category_ids: set = set()
+    for annotation in annotations_list:
+        if not isinstance(annotation, dict):
+            continue
+        image_id = annotation.get("image_id")
+        if image_id is None:
+            continue
+        annotations_by_image_id[image_id].append(annotation)
+        category_id = annotation.get("category_id")
+        if category_id is not None:
+            category_ids.add(category_id)
+
+    categories_by_id = {category_id: str(category_id) for category_id in category_ids}
+    return images, images_by_id, annotations_by_image_id, categories_by_id
+
+
+def load_coco_data(annotations_path: str, images_path: str | None = None):
+    """Load annotation data from a COCO dict file or a COCO results list file."""
+    with open(annotations_path, "r", encoding="utf-8") as file_handle:
+        coco_data = json.load(file_handle)
+
+    if isinstance(coco_data, list):
+        if not images_path:
+            raise ValueError(
+                "This JSON is a COCO results/predictions list with no image names. "
+                "Use 'Open images + JSON' so the image folder can be matched."
+            )
+        return _parse_coco_results(coco_data, images_path)
+
+    return _parse_coco_dict(coco_data)
+
+
 def has_polygons_in_dataset(annotations_by_image_id: dict) -> bool:
     """Scan entire dataset to detect if any polygons (segmentations) exist."""
+    from .rle import is_rle_segmentation
+
     for annotations in annotations_by_image_id.values():
         for annotation in annotations:
             segmentation = annotation.get("segmentation", [])
+            if is_rle_segmentation(segmentation):
+                return True
             if isinstance(segmentation, dict):
                 continue
             if segmentation and len(segmentation) > 0:
@@ -117,10 +180,9 @@ def has_polygons_in_dataset(annotations_by_image_id: dict) -> bool:
     return False
 
 
-def load_dataset_from_input(input_path: str | None):
-    """Load complete dataset with auto-detection of annotation type."""
-    images_path, annotations_path, temp_extraction = resolve_dataset_paths(input_path)
-    images, _images_by_id, annotations_by_image_id, categories_by_id = load_coco_data(annotations_path)
+def _assemble_dataset(images_path: str, annotations_path: str, temp_extraction):
+    """Build the dataset dict from resolved image and annotation paths."""
+    images, _images_by_id, annotations_by_image_id, categories_by_id = load_coco_data(annotations_path, images_path)
 
     images = sorted(images, key=lambda image_data: image_data.get("id", 0))
     class_items = sorted(categories_by_id.items(), key=lambda item: str(item[1]).lower())
@@ -140,6 +202,21 @@ def load_dataset_from_input(input_path: str | None):
         "visible_by_category": visible_by_category,
         "has_polygons": has_polygons,
     }
+
+
+def load_dataset_from_input(input_path: str | None):
+    """Load complete dataset from a zip or folder with auto-detection of annotation type."""
+    images_path, annotations_path, temp_extraction = resolve_dataset_paths(input_path)
+    return _assemble_dataset(images_path, annotations_path, temp_extraction)
+
+
+def load_dataset_from_folder_and_json(images_path: str, annotations_path: str):
+    """Load complete dataset from an explicit images folder and a COCO JSON file."""
+    if not images_path or not os.path.isdir(images_path):
+        raise ValueError("Selected images folder is not a valid directory.")
+    if not annotations_path or not os.path.isfile(annotations_path):
+        raise ValueError("Selected annotations file is not a valid file.")
+    return _assemble_dataset(os.path.abspath(images_path), os.path.abspath(annotations_path), None)
 
 
 def resolve_image_path(images_path: str, coco_file_name: str) -> str:

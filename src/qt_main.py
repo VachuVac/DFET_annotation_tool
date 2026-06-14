@@ -10,7 +10,12 @@ import sys
 from pathlib import Path
 
 from .constants import DPI_SCALE, MONITOR_HEIGHT, MONITOR_WIDTH, SIDEBAR_WIDTH
-from .data_loading import load_dataset_from_input, resolve_image_path
+from .data_loading import (
+    load_dataset_from_folder_and_json,
+    load_dataset_from_input,
+    resolve_image_path,
+)
+from .rle import is_rle_segmentation, rle_to_polygons
 from .utils import parse_arguments
 
 try:
@@ -255,7 +260,7 @@ class ImageCanvas(QWidget):
         body_font.setPointSizeF(max(10.0, 11.0 * DPI_SCALE))
         painter.setFont(body_font)
         painter.setPen(QColor(198, 201, 206))
-        painter.drawText(card_rect.adjusted(24, 58, -24, -16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "Use Open folder to load a COCO zip export or extracted folder.")
+        painter.drawText(card_rect.adjusted(24, 58, -24, -16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "Open zip / folder to load a COCO export, or Open images + JSON to pick an images folder and a COCO JSON file.")
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -591,6 +596,9 @@ class PyQtAnnotationReview(QMainWindow):
         self.current_category_ids: list[int] = []
         self.visible_by_category: dict[int, bool] = {}
         self.class_checkboxes: dict[int, ClassBubbleButton] = {}
+        # Cache of decoded RLE polygons keyed by id(annotation); decoding full
+        # masks is expensive and overlays rebuild on every class toggle.
+        self._rle_polygon_cache: dict[int, list[list[float]]] = {}
         self.last_opened_directory = self._read_last_opened_directory()
         self._build_ui()
         self._apply_styles()
@@ -870,10 +878,14 @@ class PyQtAnnotationReview(QMainWindow):
 
         sidebar_layout.addWidget(self.status_card)
 
-        self.open_button = QPushButton("Open folder")
+        self.open_button = QPushButton("Open zip / folder")
         self.open_button.setObjectName("primaryButton")
         self.open_button.clicked.connect(self._open_folder)
         sidebar_layout.addWidget(self.open_button)
+
+        self.open_images_json_button = QPushButton("Open images + JSON")
+        self.open_images_json_button.clicked.connect(self._open_images_and_json)
+        sidebar_layout.addWidget(self.open_images_json_button)
 
         self.points_checkbox = QCheckBox("Show points")
         self.points_checkbox.stateChanged.connect(self._on_points_toggled)
@@ -1227,6 +1239,31 @@ class PyQtAnnotationReview(QMainWindow):
             self._save_last_opened_directory(selected_path)
             self._load_dataset(selected_path)
 
+    def _open_images_and_json(self) -> None:
+        initial_directory = self.last_opened_directory or str(Path.cwd())
+        images_directory = QFileDialog.getExistingDirectory(
+            self, "Select images folder", initial_directory
+        )
+        if not images_directory:
+            return
+
+        annotations_file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select COCO annotations JSON",
+            images_directory,
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not annotations_file:
+            return
+
+        try:
+            loaded_dataset = load_dataset_from_folder_and_json(images_directory, annotations_file)
+        except Exception as error:
+            self._show_message(f"Dataset selection failed: {error}")
+            return
+
+        self._apply_loaded_dataset(loaded_dataset, images_directory)
+
     def _load_dataset(self, selected_path: str) -> None:
         try:
             loaded_dataset = load_dataset_from_input(selected_path)
@@ -1234,8 +1271,12 @@ class PyQtAnnotationReview(QMainWindow):
             self._show_message(f"Dataset selection failed: {error}")
             return
 
+        self._apply_loaded_dataset(loaded_dataset, selected_path)
+
+    def _apply_loaded_dataset(self, loaded_dataset: dict, directory_to_remember: str) -> None:
         self._cleanup_temp_extraction()
-        self._save_last_opened_directory(selected_path)
+        self._save_last_opened_directory(directory_to_remember)
+        self._rle_polygon_cache.clear()
 
         self.dataset = loaded_dataset
         self.temp_extraction = loaded_dataset["temp_extraction"]
@@ -1418,6 +1459,7 @@ class PyQtAnnotationReview(QMainWindow):
         self.current_annotations = []
         self.current_image_name = ""
         self.current_overlay_items = []
+        self._rle_polygon_cache.clear()
         self._cleanup_temp_extraction()
         self._clear_class_checkboxes()
         if self.image_selector:
@@ -1425,6 +1467,18 @@ class PyQtAnnotationReview(QMainWindow):
         self.canvas.set_idle()
         self._sync_canvas_state()
         self._update_status_labels()
+
+    def _polygons_for_annotation(self, annotation, segmentation) -> list[list[float]]:
+        """Return polygon contours for an RLE segmentation, decoding once and caching."""
+        cache_key = id(annotation)
+        cached = self._rle_polygon_cache.get(cache_key)
+        if cached is None:
+            try:
+                cached = rle_to_polygons(segmentation)
+            except Exception:
+                cached = []
+            self._rle_polygon_cache[cache_key] = cached
+        return cached
 
     def _build_overlay_items(self, annotations) -> list[dict]:
         overlay_items: list[dict] = []
@@ -1440,9 +1494,13 @@ class PyQtAnnotationReview(QMainWindow):
 
             if self.has_polygons:
                 segmentation = annotation.get("segmentation", [])
-                if isinstance(segmentation, dict):
+                if is_rle_segmentation(segmentation):
+                    segments = self._polygons_for_annotation(annotation, segmentation)
+                elif isinstance(segmentation, dict):
                     continue
-                for segment in segmentation:
+                else:
+                    segments = segmentation
+                for segment in segments:
                     if not isinstance(segment, list) or len(segment) < 6:
                         continue
                     points = [(float(segment[index]), float(segment[index + 1])) for index in range(0, len(segment), 2)]
@@ -1483,19 +1541,39 @@ class PyQtAnnotationReview(QMainWindow):
         self.canvas.update()
         self._update_status_labels()
 
+    @staticmethod
+    def _unreadable_message(count: int) -> str:
+        noun = "image" if count == 1 else "images"
+        return f"Could not read {count} {noun}."
+
     def _load_current_image(self, reset_fit: bool) -> None:
         if not self.dataset or not self.images:
             self.canvas.set_idle()
             return
 
-        if self.index >= len(self.images):
-            self._show_message("Last image completed")
-            self._clear_dataset()
-            return
+        # Advance past any images that cannot be read, counting them so we can
+        # report a single summary instead of one error window per failure.
+        failed_count = 0
+        while True:
+            if self.index >= len(self.images):
+                if failed_count:
+                    self._show_message(self._unreadable_message(failed_count))
+                else:
+                    self._show_message("Last image completed")
+                self._clear_dataset()
+                return
+
+            image_info = self.images[self.index]
+            image_name = str(image_info.get("file_name", ""))
+            image_path = resolve_image_path(self.images_path, image_name)
+            if self.canvas.load_image(image_path, ""):
+                self.current_image_name = image_name
+                self.current_image_path = image_path
+                break
+            failed_count += 1
+            self.index += 1
 
         image_info = self.images[self.index]
-        self.current_image_name = str(image_info.get("file_name", ""))
-        self.current_image_path = resolve_image_path(self.images_path, self.current_image_name)
         image_id = image_info.get("id")
         self.current_annotations = self.annotations_by_image_id.get(image_id, []) if image_id is not None else []
         current_category_ids = []
@@ -1522,11 +1600,6 @@ class PyQtAnnotationReview(QMainWindow):
         self.current_overlay_items = self._build_overlay_items(self.current_annotations)
 
         title = f"{self.index + 1}/{len(self.images)} - {os.path.basename(self.current_image_name)}"
-        if not self.canvas.load_image(self.current_image_path, ""):
-            self._show_message(f"Could not read image at: {self.current_image_path}")
-            self._next_image()
-            return
-
         self.canvas.set_overlay_items(self.current_overlay_items)
         self._sync_canvas_state()
         if reset_fit:
@@ -1534,6 +1607,9 @@ class PyQtAnnotationReview(QMainWindow):
         self.setWindowTitle(title)
         self._populate_class_checkboxes()
         self._update_status_labels()
+
+        if failed_count:
+            self._show_message(self._unreadable_message(failed_count))
 
     def _update_status_labels(self) -> None:
         if not self.dataset:

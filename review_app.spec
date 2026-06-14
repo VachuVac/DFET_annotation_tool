@@ -11,7 +11,7 @@ a = Analysis(
         ('src/class_colors.json', '.'),
         ('src/class_colors_default.json', '.'),
     ],
-    hiddenimports=['src.constants', 'src.utils', 'src.data_loading', 'src.qt_main'],
+    hiddenimports=['src.constants', 'src.utils', 'src.data_loading', 'src.qt_main', 'src.rle', 'numpy', 'cv2'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
