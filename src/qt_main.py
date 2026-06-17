@@ -13,20 +13,25 @@ from pathlib import Path
 
 from .constants import DPI_SCALE, MONITOR_HEIGHT, MONITOR_WIDTH, SIDEBAR_WIDTH
 from .data_loading import (
+    discover_images_dir,
     find_coco_paths,
     load_coco_data,
     load_dataset_from_folder_and_json,
     load_dataset_from_input,
     load_images_only,
+    resolve_dataset_paths,
     resolve_image_path,
+    stable_image_id,
 )
 from .rle import is_rle_segmentation, rle_to_polygons
 from .utils import parse_arguments
 from . import levels
+from .project import Project, ProjectError
 
 try:
     from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, pyqtSignal
     from PyQt6.QtGui import (
+        QAction,
         QClipboard,
         QColor,
         QFont,
@@ -52,6 +57,7 @@ try:
         QDialog,
         QFileDialog,
         QFrame,
+        QGridLayout,
         QHBoxLayout,
         QLabel,
         QMainWindow,
@@ -62,6 +68,7 @@ try:
         QSizePolicy,
         QSlider,
         QSpinBox,
+        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -69,6 +76,39 @@ except Exception as exc:
     raise RuntimeError(
         "PyQt6 is required for this version of the app. Install with: pip install PyQt6"
     ) from exc
+
+
+# Dark stylesheet for our (non-native) file dialogs and message boxes. The main
+# window's QSS only half-cascades into stock dialogs (styling buttons but not
+# line edits / item views), which leaves text fields unreadable; this gives them
+# a complete dark look so they match the app.
+_DARK_DIALOG_QSS = """
+QFileDialog, QDialog, QMessageBox { background-color: #1d2024; }
+QWidget { color: #f0f1f3; }
+QLabel { color: #f0f1f3; background: transparent; }
+QLineEdit, QComboBox, QSpinBox {
+    background-color: #111315; color: #f0f1f3;
+    border: 1px solid #5a606a; border-radius: 4px; padding: 3px 6px;
+    selection-background-color: #6a72e6; selection-color: #ffffff;
+}
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView, QListView, QTreeView {
+    background-color: #111315; color: #f0f1f3;
+    border: 1px solid #5a606a; outline: none;
+    selection-background-color: #6a72e6; selection-color: #ffffff;
+}
+QTreeView::item:hover, QListView::item:hover { background: rgba(106, 114, 230, 0.25); }
+QHeaderView::section { background-color: #1d2024; color: #c2c6ce; border: none; padding: 4px; }
+QPushButton, QToolButton {
+    background-color: #505662; color: #fafafa;
+    border: 1px solid #656d79; border-radius: 6px; padding: 5px 12px;
+}
+QPushButton:hover, QToolButton:hover { background-color: #5c6370; }
+QPushButton:default { background-color: #6a72e6; border-color: #8088ff; }
+QScrollBar:vertical { background: #1d2024; width: 12px; margin: 0; }
+QScrollBar::handle:vertical { background: #3a4048; border-radius: 6px; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
 
 
 def color_for_category(category_id: int) -> QColor:
@@ -346,7 +386,7 @@ class ImageCanvas(QWidget):
         body_font.setPointSizeF(max(10.0, 11.0 * DPI_SCALE))
         painter.setFont(body_font)
         painter.setPen(QColor(198, 201, 206))
-        painter.drawText(card_rect.adjusted(24, 58, -24, -16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "Open zip / folder to load a COCO export, or Open images + JSON to pick an images folder and a COCO JSON file.")
+        painter.drawText(card_rect.adjusted(24, 58, -24, -16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "Create or open a project, then use the Import menu to add images and annotations.")
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -687,9 +727,14 @@ class ImageCanvas(QWidget):
             is_selected = self._selected_annotation is not None and item.get("annotation") is self._selected_annotation
             if is_selected:
                 painter.setPen(QPen(QColor(255, 255, 255), max(2.0, 2.4 * DPI_SCALE)))
+            elif item.get("pending_redefine"):
+                # Dashed, thicker outline + no fill = "this still needs redefining".
+                pending_pen = QPen(outline_color, max(2.0, 2.2 * DPI_SCALE))
+                pending_pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pending_pen)
             else:
                 painter.setPen(QPen(outline_color, max(1.0, 1.2 * DPI_SCALE)))
-            painter.setBrush(fill_color)
+            painter.setBrush(Qt.BrushStyle.NoBrush if item.get("pending_redefine") else fill_color)
 
             if item["shape"] == "polygon":
                 polygon = QPolygonF(screen_points)
@@ -1397,6 +1442,148 @@ class ShortcutsDialog(QDialog):
         )
 
 
+_REDEFINE_QSS = _DARK_DIALOG_QSS + """
+#redefineDialog { background: #1d2024; }
+#redefineDialog QLabel { color: #eef0f3; font-size: 10pt; }
+#redefineDialog QLabel#redefineIntro { color: #c2c6ce; }
+#redefineDialog QLabel#redefineHeader { color: #aeb3bd; font-weight: 700; }
+#redefineDialog QLabel#redefineClass { color: #ffffff; font-weight: 700; font-size: 11pt; }
+#redefineDialog QLabel#redefineCount { color: #c2c6ce; }
+#redefineDialog QComboBox { min-width: 210px; padding: 5px 8px; }
+#redefineRow { border-bottom: 1px solid #2c3036; }
+"""
+
+
+class RedefineDialog(QDialog):
+    """Map imported off-catalog classes onto a level (and, optionally, a class).
+
+    One row per unknown class: a Level dropdown and a Class dropdown (the class
+    list follows the chosen level). Three outcomes per row:
+      * level + class  -> full remap (annotations move into that level/class),
+      * level only     -> annotations become VISIBLE in that level, highlighted
+                          as "needs redefine" (kept in the stash, not committed),
+      * neither        -> left for later.
+    Remap-to-existing only (no new classes).
+    """
+
+    def __init__(
+        self,
+        owner: "PyQtAnnotationReview",
+        class_counts: dict[str, int],
+        assigned_levels: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(owner)
+        self.setObjectName("redefineDialog")
+        self.setWindowTitle("Redefine classes")
+        self.setStyleSheet(_REDEFINE_QSS)
+        self.setMinimumSize(620, 320)
+        assigned_levels = assigned_levels or {}
+        self._rows: list[tuple[str, QComboBox, QComboBox]] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+        intro = QLabel(
+            "These imported classes aren't in the catalog. Choose a Level and an "
+            "existing Class to remap each. Pick a Level only (leave Class blank) to "
+            "keep the annotations visible in that level, highlighted as needing "
+            "redefinition. Mappings are saved with the project."
+        )
+        intro.setObjectName("redefineIntro")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(2, 2, 2, 2)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(10)
+        for column, heading in enumerate(("Unknown class", "Count", "Level", "Map to class (optional)")):
+            label = QLabel(heading)
+            label.setObjectName("redefineHeader")
+            grid.addWidget(label, 0, column)
+
+        for row, (raw_class, count) in enumerate(sorted(class_counts.items()), start=1):
+            name_label = QLabel(raw_class)
+            name_label.setObjectName("redefineClass")
+            grid.addWidget(name_label, row, 0)
+            count_label = QLabel(f"×{count}")
+            count_label.setObjectName("redefineCount")
+            grid.addWidget(count_label, row, 1)
+
+            level_combo = QComboBox()
+            level_combo.addItem("— pick level —", None)
+            for level_id in levels.LEVEL_IDS:
+                level_combo.addItem(f"L{level_id} · {levels.level_title(level_id)}", level_id)
+            grid.addWidget(level_combo, row, 2)
+
+            class_combo = QComboBox()
+            class_combo.setEnabled(False)
+            grid.addWidget(class_combo, row, 3)
+
+            level_combo.currentIndexChanged.connect(
+                lambda _i, lc=level_combo, cc=class_combo: self._on_level_changed(lc, cc)
+            )
+            # Pre-select a previously chosen level-only assignment.
+            preset = assigned_levels.get(raw_class)
+            if preset is not None:
+                index = level_combo.findData(preset)
+                if index >= 0:
+                    level_combo.setCurrentIndex(index)
+            self._rows.append((raw_class, level_combo, class_combo))
+
+        grid.setColumnStretch(3, 1)
+        grid.setRowStretch(len(self._rows) + 1, 1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(cancel_button)
+        apply_button = QPushButton("Apply")
+        apply_button.setObjectName("primaryButton")
+        apply_button.clicked.connect(self.accept)
+        button_row.addWidget(apply_button)
+        layout.addLayout(button_row)
+
+    @staticmethod
+    def _on_level_changed(level_combo: QComboBox, class_combo: QComboBox) -> None:
+        class_combo.clear()
+        level = level_combo.currentData()
+        if level is None:
+            class_combo.setEnabled(False)
+            return
+        class_combo.setEnabled(True)
+        class_combo.addItem("— leave for later —", None)
+        for class_name, _color in levels.level_classes(level):
+            class_combo.addItem(class_name, class_name)
+
+    def mappings(self) -> dict[str, tuple[int, str]]:
+        """{raw_class: (level, target_class)} for rows where BOTH are chosen."""
+        result: dict[str, tuple[int, str]] = {}
+        for raw_class, level_combo, class_combo in self._rows:
+            level = level_combo.currentData()
+            target = class_combo.currentData()
+            if level is not None and target:
+                result[raw_class] = (int(level), str(target))
+        return result
+
+    def level_only(self) -> dict[str, int]:
+        """{raw_class: level} for rows with a Level but no Class (mark-for-redefine)."""
+        result: dict[str, int] = {}
+        for raw_class, level_combo, class_combo in self._rows:
+            level = level_combo.currentData()
+            target = class_combo.currentData()
+            if level is not None and not target:
+                result[raw_class] = int(level)
+        return result
+
+
 class PyQtAnnotationReview(QMainWindow):
     """Main PyQt window that mirrors the previous OpenCV app behavior."""
 
@@ -1424,7 +1611,11 @@ class PyQtAnnotationReview(QMainWindow):
         # Keyed by basename so they survive id-scheme changes across sessions.
         self.annotation_store: dict[int, dict[str, list]] = {lvl: {} for lvl in levels.LEVEL_IDS}
         # Folder the per-level COCO JSON files live in (the images folder's parent pick).
+        # When a project is open this points at <project>/annotations.
         self.annotation_root = ""
+        # The open project (shared working area for both modes), or None on the
+        # welcome screen. Replaces ad-hoc folder picking once a project exists.
+        self.project: Project | None = None
         # Each mode keeps its own loaded session so toggling doesn't lose work.
         self._sessions: dict[str, dict] = {}
 
@@ -1571,15 +1762,35 @@ class PyQtAnnotationReview(QMainWindow):
         return label
 
     def _build_ui(self) -> None:
+        self._build_menu_bar()
+
+        # Two-page central area: a welcome screen (no project) and the working
+        # view (canvas + sidebar). _update_project_chrome() picks which shows.
+        self.view_stack = QStackedWidget()
+        self.setCentralWidget(self.view_stack)
+
+        self.welcome_page = self._build_welcome_page()
+        self.view_stack.addWidget(self.welcome_page)  # index 0
+
         root = QWidget()
-        self.setCentralWidget(root)
+        self.view_stack.addWidget(root)  # index 1
 
         main_layout = QHBoxLayout(root)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        # The canvas and an "empty state" overlay share one grid cell so the
+        # overlay (3 import buttons) covers the canvas when no image is shown.
         self.canvas = ImageCanvas()
-        main_layout.addWidget(self.canvas, 1)
+        canvas_container = QWidget()
+        canvas_grid = QGridLayout(canvas_container)
+        canvas_grid.setContentsMargins(0, 0, 0, 0)
+        canvas_grid.addWidget(self.canvas, 0, 0)
+        self.empty_overlay = self._build_empty_overlay()
+        canvas_grid.addWidget(self.empty_overlay, 0, 0)
+        self.empty_overlay.raise_()
+        self.empty_overlay.setVisible(False)
+        main_layout.addWidget(canvas_container, 1)
 
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
@@ -1776,12 +1987,16 @@ class PyQtAnnotationReview(QMainWindow):
 
         sidebar_layout.addWidget(self._make_divider())
 
+        # Retired: loading now flows through New/Open project + the Import menu.
+        # Kept (hidden) only so existing references stay valid.
         self.open_button = QPushButton("Open zip / folder")
         self.open_button.clicked.connect(self._open_folder)
+        self.open_button.setVisible(False)
         sidebar_layout.addWidget(self.open_button)
 
         self.open_images_json_button = QPushButton("Open images + JSON")
         self.open_images_json_button.clicked.connect(self._open_images_and_json)
+        self.open_images_json_button.setVisible(False)
         sidebar_layout.addWidget(self.open_images_json_button)
 
         # Annotation-mode entry: pick an images folder (resumes per-level JSONs if present).
@@ -1926,6 +2141,659 @@ class PyQtAnnotationReview(QMainWindow):
         status_bar.addWidget(self.status_label, 1)
         status_bar.addPermanentWidget(self.help_button)
 
+        # Start on the welcome screen until a project is created/opened.
+        self._update_project_chrome()
+
+    # ----- project: menu bar, welcome screen, open/close -------------------
+    def _build_menu_bar(self) -> None:
+        """Top menu bar: Project / Import / Settings (the project control surface)."""
+        bar = self.menuBar()
+
+        project_menu = bar.addMenu("&Project")
+        self.action_new_project = QAction("New project…", self)
+        self.action_new_project.triggered.connect(self._new_project)
+        project_menu.addAction(self.action_new_project)
+        self.action_open_project = QAction("Open project…", self)
+        self.action_open_project.triggered.connect(self._open_project)
+        project_menu.addAction(self.action_open_project)
+        project_menu.addSeparator()
+        self.action_close_project = QAction("Close project", self)
+        self.action_close_project.triggered.connect(self._close_project)
+        project_menu.addAction(self.action_close_project)
+        project_menu.addSeparator()
+        self.action_redefine = QAction("Redefine classes…", self)
+        self.action_redefine.setToolTip("Assign imported off-catalog classes to a level + existing class")
+        self.action_redefine.triggered.connect(self._open_redefine_dialog)
+        self.action_redefine.setEnabled(False)
+        project_menu.addAction(self.action_redefine)
+        project_menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+        project_menu.addAction(quit_action)
+
+        # Import actions only make sense inside an open project. Zip is first:
+        # it is the fullest import (images + annotation JSONs in one archive).
+        self.import_menu = bar.addMenu("&Import")
+        self.action_import_zip = QAction("Open zip…", self)
+        self.action_import_zip.setToolTip("Import an export zip (images + annotation JSONs)")
+        self.action_import_zip.triggered.connect(self._import_zip)
+        self.import_menu.addAction(self.action_import_zip)
+        self.action_import_images = QAction("Open image folder…", self)
+        self.action_import_images.triggered.connect(self._import_image_folder)
+        self.import_menu.addAction(self.action_import_images)
+        self.action_import_annotations = QAction("Open annotations…", self)
+        self.action_import_annotations.setToolTip("Import annotation JSON(s) — available once the project has images")
+        self.action_import_annotations.triggered.connect(self._import_annotations)
+        self.import_menu.addAction(self.action_import_annotations)
+
+        settings_menu = bar.addMenu("&Settings")
+        shortcuts_action = QAction("Keyboard shortcuts…", self)
+        shortcuts_action.triggered.connect(self._show_help)
+        settings_menu.addAction(shortcuts_action)
+
+    def _build_welcome_page(self) -> QWidget:
+        """The opening screen shown when no project is open."""
+        page = QWidget()
+        page.setObjectName("welcomePage")
+        outer = QVBoxLayout(page)
+        outer.addStretch(1)
+
+        column = QVBoxLayout()
+        column.setSpacing(14)
+
+        title = QLabel("Annotation Workbench")
+        title.setObjectName("header")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(title)
+
+        subtitle = QLabel("Create a new project or open an existing one to begin.")
+        subtitle.setObjectName("muted")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(subtitle)
+        column.addSpacing(8)
+
+        new_button = QPushButton("New project…")
+        new_button.setObjectName("primaryButton")
+        new_button.setMinimumHeight(44)
+        new_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_button.clicked.connect(self._new_project)
+        column.addWidget(new_button)
+
+        open_button = QPushButton("Open project…")
+        open_button.setMinimumHeight(44)
+        open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_button.clicked.connect(self._open_project)
+        column.addWidget(open_button)
+
+        container = QWidget()
+        container.setLayout(column)
+        container.setFixedWidth(340)
+
+        centering = QHBoxLayout()
+        centering.addStretch(1)
+        centering.addWidget(container)
+        centering.addStretch(1)
+        outer.addLayout(centering)
+        outer.addStretch(1)
+        return page
+
+    def _build_empty_overlay(self) -> QWidget:
+        """Covers the canvas when a project is open but no image is shown.
+
+        Holds the same three import actions as the Import menu, centered, so the
+        user can load data without going to the menu bar.
+        """
+        overlay = QWidget()
+        overlay.setObjectName("emptyOverlay")
+        outer = QVBoxLayout(overlay)
+        outer.addStretch(1)
+
+        card = QFrame()
+        card.setObjectName("emptyCard")
+        card.setFixedWidth(440)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(28, 26, 28, 26)
+        card_layout.setSpacing(12)
+
+        title = QLabel("No images yet")
+        title.setObjectName("header")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(title)
+        subtitle = QLabel("Import a zip, an image folder, or annotations to start working.")
+        subtitle.setObjectName("muted")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setWordWrap(True)
+        card_layout.addWidget(subtitle)
+        card_layout.addSpacing(6)
+
+        zip_button = QPushButton("Open zip…")
+        zip_button.setObjectName("primaryButton")
+        zip_button.setMinimumHeight(40)
+        zip_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        zip_button.clicked.connect(self._import_zip)
+        card_layout.addWidget(zip_button)
+
+        images_button = QPushButton("Open image folder…")
+        images_button.setMinimumHeight(40)
+        images_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        images_button.clicked.connect(self._import_image_folder)
+        card_layout.addWidget(images_button)
+
+        self.empty_annotations_button = QPushButton("Open annotations…")
+        self.empty_annotations_button.setMinimumHeight(40)
+        self.empty_annotations_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.empty_annotations_button.setToolTip("Available once the project has images")
+        self.empty_annotations_button.clicked.connect(self._import_annotations)
+        card_layout.addWidget(self.empty_annotations_button)
+
+        centering = QHBoxLayout()
+        centering.addStretch(1)
+        centering.addWidget(card)
+        centering.addStretch(1)
+        outer.addLayout(centering)
+        outer.addStretch(1)
+        return overlay
+
+    def _refresh_canvas_placeholder(self) -> None:
+        """Show the 3-button empty overlay when a project is open but no image shows."""
+        if not hasattr(self, "empty_overlay"):
+            return
+        has_images = self.project is not None and bool(self.project.registry_images())
+        show = self.project is not None and not self.canvas.has_image
+        self.empty_overlay.setVisible(show)
+        if show:
+            self.empty_overlay.raise_()
+        if hasattr(self, "empty_annotations_button"):
+            self.empty_annotations_button.setEnabled(has_images)
+
+    def _update_project_chrome(self) -> None:
+        """Reflect project-open state in the window: which page shows, title, menus."""
+        has_project = self.project is not None
+        has_images = has_project and bool(self.project.registry_images())
+        # view_stack/import_menu exist only after _build_ui has created them.
+        if hasattr(self, "view_stack"):
+            self.view_stack.setCurrentIndex(1 if has_project else 0)
+        if hasattr(self, "action_close_project"):
+            self.action_close_project.setEnabled(has_project)
+        if hasattr(self, "import_menu"):
+            self.import_menu.setEnabled(has_project)
+            # Annotations need images to attach to: greyed until the project has any.
+            self.action_import_annotations.setEnabled(has_images)
+        if has_project:
+            counts = self.project.level_counts()
+            total = sum(counts.values())
+            self.setWindowTitle(
+                f"Annotation Workbench — {self.project.name}"
+                f"  ({len(self.project.registry_images())} images, {total} annotations)"
+            )
+        else:
+            self.setWindowTitle("Annotation Workbench")
+        self._refresh_canvas_placeholder()
+        self._update_redefine_action()
+
+    def _new_project(self) -> None:
+        # One step using the NATIVE Windows explorer: its "Save As" dialog is real
+        # explorer with a filename field, so the user browses to the destination
+        # and types the project name in the bottom box (no separate name prompt).
+        target_path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "New project — choose a location and type the project name",
+            self.last_opened_directory or str(Path.cwd()),
+        )
+        if not target_path:
+            return
+        target = Path(target_path)
+        try:
+            project = Project.create(str(target.parent), target.name)
+        except ProjectError as error:
+            self._show_message(str(error))
+            return
+        self._save_last_opened_directory(str(target.parent))
+        self._activate_project(project)
+
+    def _open_project(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Open project folder", self.last_opened_directory or str(Path.cwd())
+        )
+        if not folder:
+            return
+        try:
+            project = Project.open(folder)
+        except ProjectError as error:
+            self._show_message(str(error))
+            return
+        self._save_last_opened_directory(folder)
+        self._activate_project(project)
+
+    def _activate_project(self, project: Project) -> None:
+        """Make ``project`` the open project and load its images/levels into the session."""
+        self.project = project
+        self._sessions.clear()  # drop any previous project's per-mode sessions
+        self._apply_project_session()
+        self._update_project_chrome()
+
+    def _close_project(self) -> None:
+        if self.project is None:
+            return
+        # TODO(Stage G): warn on unsaved changes before closing.
+        self.project = None
+        self._sessions.clear()
+        self._reset_session_state()
+        self.canvas.set_idle()
+        self.current_overlay_items = []
+        self._populate_image_selector()
+        self._update_status_labels()
+        self._update_action_buttons()
+        self._update_project_chrome()
+
+    def _apply_project_session(self, reset_index: bool = True) -> None:
+        """Load the open project's images + per-level stores into the current session.
+
+        Bridges the project layout onto the existing annotation plumbing:
+        ``images_path`` -> <project>/images and ``annotation_root`` ->
+        <project>/annotations, so the existing per-level load/save code writes
+        into the project unchanged. ``images`` comes from the master registry.
+        """
+        if self.project is None:
+            return
+        self._cleanup_temp_extraction()
+        self._rle_polygon_cache.clear()
+        self._dirty = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.dataset = {"annotation": True}  # truthy sentinel so shared guards pass
+        self.temp_extraction = None
+        self.images_path = str(self.project.images_dir)
+        self.annotation_root = str(self.project.annotations_dir)
+        self.images = [dict(record) for record in self.project.registry_images()]
+        self.annotations_by_image_id = {}
+        self.annotation_store = {lvl: {} for lvl in levels.LEVEL_IDS}
+        self.categories_by_id = {}
+        self.class_items = []
+        self.current_category_ids = []
+        self.current_class_items = []
+        if reset_index:
+            self.index = 0
+        elif self.images:
+            self.index = max(0, min(self.index, len(self.images) - 1))
+        self._load_existing_level_files()
+        self._populate_image_selector()
+        if self.images:
+            self._load_current_image(reset_fit=True)
+        else:
+            self.canvas.set_idle()
+            self.current_overlay_items = []
+        self._update_status_labels()
+        self._update_action_buttons()
+        self._sync_canvas_state()
+        self._sync_draw_state()
+
+    def _import_image_folder(self) -> None:
+        """Import: copy an image folder into the project (dedup), then promote stash."""
+        if self.project is None:
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose an image folder to import", self.last_opened_directory or str(Path.cwd())
+        )
+        if not folder:
+            return
+        source_dir = discover_images_dir(folder)
+        try:
+            report = self.project.import_images(source_dir)
+            promoted = self.project.promote_pending()
+        except ProjectError as error:
+            self._show_message(str(error))
+            return
+        self._save_last_opened_directory(folder)
+        self._apply_project_session(reset_index=False)
+        self._update_project_chrome()
+        message = (
+            f"Imported {len(report['copied'])} image(s); "
+            f"skipped {len(report['skipped'])} already present."
+        )
+        if promoted.get("promoted"):
+            message += f"\nPromoted {promoted['promoted']} stashed annotation(s) into their levels."
+        self._show_message(message)
+
+    def _import_zip(self) -> None:
+        """Import an export zip: copy its images (dedup) + route its annotations."""
+        if self.project is None:
+            return
+        zip_path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Open export zip (images + annotation JSONs)",
+            self.last_opened_directory or str(Path.cwd()),
+            "Zip archives (*.zip);;All files (*.*)",
+        )
+        if not zip_path:
+            return
+        temp_extraction = None
+        try:
+            images_path, annotations_path, temp_extraction = resolve_dataset_paths(zip_path)
+            self.project.import_images(images_path, source=f"zip:{Path(zip_path).name}")
+            self.project.promote_pending()
+            images, _by_id, annotations_by_image_id, categories_by_id = load_coco_data(
+                annotations_path, images_path
+            )
+        except Exception as error:  # noqa: BLE001 - surface any extract/parse failure
+            self._show_message(f"Could not import zip: {error}")
+            return
+        finally:
+            if temp_extraction is not None:
+                # Images are already copied into the project; the temp extract can go.
+                try:
+                    temp_extraction.cleanup()
+                except Exception:
+                    pass
+        self._save_last_opened_directory(zip_path)
+        self._route_and_commit_annotations(images, annotations_by_image_id, categories_by_id)
+
+    def _import_annotations(self) -> None:
+        """Import annotation JSON(s) into the project's levels (image must be present)."""
+        if self.project is None:
+            return
+        json_path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Open annotations JSON",
+            self.last_opened_directory or str(Path.cwd()),
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not json_path:
+            return
+        try:
+            images, _by_id, annotations_by_image_id, categories_by_id = load_coco_data(
+                json_path, str(self.project.images_dir)
+            )
+        except Exception as error:  # noqa: BLE001
+            self._show_message(f"Could not load annotations: {error}")
+            return
+        self._save_last_opened_directory(json_path)
+        self._route_and_commit_annotations(images, annotations_by_image_id, categories_by_id)
+
+    def _ask_conflict_resolution(self, conflict_count: int) -> str:
+        """Ask how to handle images that already have annotations. Returns the choice.
+
+        'append' (add to existing), 'replace' (overwrite existing), or 'close'
+        (cancel the WHOLE import — nothing is written).
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Annotation conflicts")
+        box.setIcon(QMessageBox.Icon.NoIcon)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            f"{conflict_count} image/level pair(s) already have annotations.\n\n"
+            "Append the imported annotations to them, replace them, or cancel "
+            "the whole import?"
+        )
+        append_button = box.addButton("Append", QMessageBox.ButtonRole.AcceptRole)
+        replace_button = box.addButton("Replace", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Close (cancel import)", QMessageBox.ButtonRole.RejectRole)
+        box.setStyleSheet(_DARK_DIALOG_QSS + "QPushButton { min-width: 96px; }")
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is append_button:
+            return "append"
+        if clicked is replace_button:
+            return "replace"
+        return "close"
+
+    def _route_and_commit_annotations(self, images, annotations_by_image_id, categories_by_id) -> None:
+        """Sort a loaded dataset's annotations into the project's levels and commit.
+
+        Routes each annotation to a level by class name, dropping off-catalog and
+        geometry-less ones (reported). Annotations whose image is present are
+        added (or, on conflict, resolved via the Append/Replace/Close dialog);
+        annotations whose image is absent are stashed. Close aborts the entire
+        import, writing nothing.
+        """
+        if self.project is None:
+            return
+
+        id_to_name = {
+            image.get("id"): os.path.basename(str(image.get("file_name", "")))
+            for image in images
+        }
+
+        # Bucket converted annotations by level -> image basename, recording WHY
+        # anything was dropped so the report can explain it.
+        buckets: dict[int, dict[str, list]] = {lvl: {} for lvl in levels.LEVEL_IDS}
+        off_catalog: dict[str, int] = {}   # unknown class name -> count
+        no_geometry: dict[str, int] = {}   # known class but unusable geometry -> count
+        no_image_ref = 0                    # annotation whose image_id isn't in the file
+        unmapped_entries: list[dict] = []   # off-catalog -> stashed raw for Redefine
+        for image_id, annotations in annotations_by_image_id.items():
+            basename = id_to_name.get(image_id)
+            if not basename:
+                no_image_ref += len(annotations)
+                continue
+            for annotation in annotations:
+                class_name = categories_by_id.get(annotation.get("category_id"))
+                label = str(class_name) if class_name is not None else f"category {annotation.get('category_id')}"
+                resolved = self._resolve_class(class_name)
+                if resolved is None:
+                    # Off-catalog: keep the raw annotation for Redefine (not dropped).
+                    off_catalog[label] = off_catalog.get(label, 0) + 1
+                    unmapped_entries.append(
+                        {
+                            "raw_class": label,
+                            "stable_image_id": stable_image_id(basename),
+                            "file_name": basename,
+                            "source_annotation": annotation,
+                        }
+                    )
+                    continue
+                level, target = resolved
+                converted = self._convert_source_annotation(annotation, level, target)
+                if converted is None:
+                    no_geometry[label] = no_geometry.get(label, 0) + 1
+                    continue
+                buckets[level].setdefault(basename, []).append(converted)
+
+        present = set(self.project.basename_to_id().keys())
+        existing_stores = {lvl: self.project.read_level(lvl) for lvl in levels.LEVEL_IDS}
+
+        additions: list[tuple[int, str, list]] = []   # present, no existing -> just add
+        conflicts: list[tuple[int, str, list]] = []   # present, existing -> ask
+        orphans: list[tuple[int, str, list]] = []     # image absent -> stash
+        for level, by_name in buckets.items():
+            for basename, anns in by_name.items():
+                if basename not in present:
+                    orphans.append((level, basename, anns))
+                elif existing_stores[level].get(basename):
+                    conflicts.append((level, basename, anns))
+                else:
+                    additions.append((level, basename, anns))
+
+        mode = "append"
+        if conflicts:
+            mode = self._ask_conflict_resolution(len(conflicts))
+            if mode == "close":
+                self._show_message("Import cancelled — nothing was changed.")
+                return
+
+        # Commit. (All decisions are made; only now do we touch disk.)
+        changed_levels: set[int] = set()
+        for level, basename, anns in additions:
+            existing_stores[level].setdefault(basename, []).extend(anns)
+            changed_levels.add(level)
+        for level, basename, anns in conflicts:
+            if mode == "replace":
+                existing_stores[level][basename] = list(anns)
+            else:
+                existing_stores[level].setdefault(basename, []).extend(anns)
+            changed_levels.add(level)
+        for level in changed_levels:
+            self.project.write_level(level, existing_stores[level])
+
+        stash_entries = [
+            {
+                "level": level,
+                "stable_image_id": stable_image_id(basename),
+                "file_name": basename,
+                "annotation": annotation,
+            }
+            for level, basename, anns in orphans
+            for annotation in anns
+        ]
+        if stash_entries:
+            self.project.stash_annotations(stash_entries)
+        if unmapped_entries:
+            self.project.stash_unmapped(unmapped_entries)
+
+        self._apply_project_session(reset_index=False)
+        self._update_project_chrome()
+
+        added = sum(len(a) for _l, _b, a in additions) + sum(len(a) for _l, _b, a in conflicts)
+        message = f"Imported {added} annotation(s) into levels."
+        if conflicts:
+            message += f"\n{len(conflicts)} conflict(s) {mode}d."
+        if stash_entries:
+            message += f"\n{len(stash_entries)} stashed (image not in project yet)."
+
+        # Off-catalog classes are set aside (not dropped) — they're resolvable in Redefine.
+        off_total = sum(off_catalog.values())
+        geo_total = sum(no_geometry.values())
+        if off_total:
+            message += (
+                f"\n\n{off_total} annotation(s) use {len(off_catalog)} unknown class(es), "
+                "set aside for Redefine:\n  " + self._format_class_counts(off_catalog)
+            )
+        if geo_total:
+            message += (
+                f"\n\n{geo_total} dropped — no usable geometry (e.g. RLE-only masks):\n  "
+                + self._format_class_counts(no_geometry)
+            )
+        if no_image_ref:
+            message += f"\n\n{no_image_ref} skipped — annotation referenced an image not in the file."
+        self._show_message(message)
+
+        # Auto-pop Redefine when this import introduced new unknown classes.
+        if unmapped_entries:
+            self._open_redefine_dialog()
+
+    def _resolve_class(self, class_name) -> "tuple[int, str] | None":
+        """Resolve a source class name to (level, target_class), honouring saved remaps.
+
+        Returns None for off-catalog classes that have no saved remap yet.
+        """
+        if class_name is None:
+            return None
+        name = str(class_name)
+        level = levels.level_for_class(name)
+        if level is not None:
+            return level, name
+        remap = self.project.remap_for(name) if self.project is not None else None
+        if remap:
+            return remap["level"], remap["target"]
+        return None
+
+    @staticmethod
+    def _format_class_counts(counts: dict[str, int], limit: int = 12) -> str:
+        """'name ×N, other ×M (+k more)' for a drop-reason breakdown."""
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        shown = ", ".join(f"{name} ×{count}" for name, count in ordered[:limit])
+        if len(ordered) > limit:
+            shown += f" (+{len(ordered) - limit} more)"
+        return shown
+
+    # ----- Redefine: resolve off-catalog classes -------------------------
+    def _promote_unmapped(self) -> dict:
+        """Convert+route stashed off-catalog annotations whose class is now remapped.
+
+        Returns ``{"promoted": N, "remaining": M}``. Resolved annotations land in
+        the target level (or the image-orphan stash if their image isn't present).
+        """
+        if self.project is None:
+            return {"promoted": 0, "remaining": 0}
+        pending = self.project.read_unmapped()
+        if not pending:
+            return {"promoted": 0, "remaining": 0}
+
+        present = set(self.project.basename_to_id().keys())
+        additions: dict[int, dict[str, list]] = {}
+        orphan_entries: list[dict] = []
+        remaining: list[dict] = []
+        promoted = 0
+        for entry in pending:
+            remap = self.project.remap_for(str(entry.get("raw_class", "")))
+            if not remap:
+                remaining.append(entry)
+                continue
+            converted = self._convert_source_annotation(
+                entry.get("source_annotation", {}), remap["level"], remap["target"]
+            )
+            if converted is None:
+                remaining.append(entry)  # geometry-less: keep stashed rather than lose it
+                continue
+            basename = os.path.basename(str(entry.get("file_name", "")))
+            if basename in present:
+                additions.setdefault(remap["level"], {}).setdefault(basename, []).append(converted)
+            else:
+                orphan_entries.append(
+                    {
+                        "level": remap["level"],
+                        "stable_image_id": int(entry.get("stable_image_id", stable_image_id(basename))),
+                        "file_name": basename,
+                        "annotation": converted,
+                    }
+                )
+            promoted += 1
+
+        for level, by_name in additions.items():
+            store = self.project.read_level(level)
+            for basename, anns in by_name.items():
+                store.setdefault(basename, []).extend(anns)
+            self.project.write_level(level, store)
+        if orphan_entries:
+            self.project.stash_annotations(orphan_entries)
+        self.project.write_unmapped(remaining)
+        return {"promoted": promoted, "remaining": len(remaining)}
+
+    def _open_redefine_dialog(self) -> None:
+        """Show the Redefine dialog for the project's stashed off-catalog classes."""
+        if self.project is None:
+            return
+        counts = self.project.unmapped_class_counts()
+        if not counts:
+            self._show_message("No unknown classes to redefine.")
+            self._update_redefine_action()
+            return
+        dialog = RedefineDialog(self, counts, self.project.unmapped_assigned_levels())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        mappings = dialog.mappings()
+        level_only = dialog.level_only()
+        if not mappings and not level_only:
+            self._update_redefine_action()
+            return
+        # Level-only: park the class in a level (visible + highlighted, not committed).
+        for raw_class, level in level_only.items():
+            self.project.set_unmapped_level(raw_class, level)
+        # Full remaps: record + promote into the level files.
+        for raw_class, (level, target) in mappings.items():
+            self.project.set_class_remap(raw_class, level, target)
+        result = self._promote_unmapped()
+        self._apply_project_session(reset_index=False)
+        self._refresh_overlay_items()
+        self._update_project_chrome()
+        self._update_redefine_action()
+        parts = []
+        if mappings:
+            parts.append(f"Redefined {len(mappings)} class(es); moved {result['promoted']} annotation(s) into levels.")
+        if level_only:
+            parts.append(f"Parked {len(level_only)} class(es) for redefinition (shown highlighted in their level).")
+        if result["remaining"]:
+            parts.append(f"{result['remaining']} still awaiting redefinition.")
+        self._show_message("\n".join(parts))
+
+    def _update_redefine_action(self) -> None:
+        """Enable + badge the Redefine menu item with the pending-class count."""
+        if not hasattr(self, "action_redefine"):
+            return
+        count = len(self.project.unmapped_class_counts()) if self.project is not None else 0
+        self.action_redefine.setEnabled(self.project is not None and count > 0)
+        self.action_redefine.setText(f"Redefine classes… ({count})" if count else "Redefine classes…")
+
     def _apply_styles(self) -> None:
         base_font_size = max(10, int(round(10 * DPI_SCALE)))
         header_size = max(14, int(round(14 * DPI_SCALE)))
@@ -1984,6 +2852,41 @@ class PyQtAnnotationReview(QMainWindow):
             }}
             QLabel#muted {{
                 color: #c2c6ce;
+            }}
+            QWidget#welcomePage {{
+                background: #111315;
+            }}
+            QWidget#emptyOverlay {{
+                background: #141619;
+            }}
+            QFrame#emptyCard {{
+                background: #1c1f24;
+                border: 1px solid #4e545d;
+                border-radius: 18px;
+            }}
+            QMenuBar {{
+                background: #1c1f24;
+                color: #e6e8ec;
+                border-bottom: 1px solid #3a4048;
+            }}
+            QMenuBar::item {{
+                background: transparent;
+                padding: 5px 12px;
+            }}
+            QMenuBar::item:selected {{
+                background: #2f343c;
+            }}
+            QMenu {{
+                background: #1d2024;
+                color: #e6e8ec;
+                border: 1px solid #3a4048;
+            }}
+            QMenu::item:selected {{
+                background: #6a72e6;
+                color: #ffffff;
+            }}
+            QMenu::item:disabled {{
+                color: #7b818b;
             }}
             QLabel#statPrimary {{
                 font-weight: 700;
@@ -2233,9 +3136,7 @@ class PyQtAnnotationReview(QMainWindow):
         message_box.setText(text)
         message_box.setStandardButtons(QMessageBox.StandardButton.Ok)
         message_box.setTextFormat(Qt.TextFormat.PlainText)
-        message_box.setStyleSheet(
-            "QLabel { color: #1f2328; } QMessageBox { background: #ffffff; } QPushButton { min-width: 72px; }"
-        )
+        message_box.setStyleSheet(_DARK_DIALOG_QSS + "QPushButton { min-width: 72px; }")
         message_box.exec()
 
     def _read_last_opened_directory(self) -> str | None:
@@ -2391,14 +3292,11 @@ class PyQtAnnotationReview(QMainWindow):
         self.canvas.set_edit_enabled(checked)
 
     def _on_draw_toggled(self, checked: bool) -> None:
-        """Arm/disarm drawing new annotations with the active class."""
-        if checked:
-            if self.edit_objects_button.isChecked():
-                self.edit_objects_button.setChecked(False)
-            if self._active_category() is None:
-                self.draw_button.setChecked(False)
-                self._show_message("Pick a class first, then turn on Draw.")
-                return
+        """Arm/disarm drawing. Draw can be turned on without a class selected —
+        the pen just stays inactive (you can't draw) until you pick one; it then
+        activates immediately via ``_sync_draw_state`` when a class is chosen."""
+        if checked and self.edit_objects_button.isChecked():
+            self.edit_objects_button.setChecked(False)  # editing and drawing are exclusive
         self._sync_draw_state()
 
     def _sync_draw_state(self) -> None:
@@ -2499,14 +3397,17 @@ class PyQtAnnotationReview(QMainWindow):
         if mode not in ("validation", "annotation"):
             return
         if mode != self.mode:
-            # Stash the current session and restore (or start fresh) the target one.
             self.canvas.cancel_drawing()
             self.canvas.clear_selection()
-            self._sessions[self.mode] = self._snapshot_session()
-            if mode in self._sessions:
-                self._restore_session(self._sessions[mode])
-            else:
-                self._reset_session_state()
+            # In a project both modes share one set of images + per-level stores,
+            # so we keep the session intact and just re-render. Without a project
+            # each mode keeps its own independent dataset (legacy behaviour).
+            if self.project is None:
+                self._sessions[self.mode] = self._snapshot_session()
+                if mode in self._sessions:
+                    self._restore_session(self._sessions[mode])
+                else:
+                    self._reset_session_state()
             self._rle_polygon_cache.clear()
         self.mode = mode
         is_annotation = mode == "annotation"
@@ -2516,11 +3417,12 @@ class PyQtAnnotationReview(QMainWindow):
         self.level_selector_widget.setVisible(is_annotation)
         # Show-all / hide-all only make sense for multi-visibility validation.
         self.class_action_widget.setVisible(not is_annotation)
-        # Swap open entries + annotation-only controls.
-        self.open_button.setVisible(not is_annotation)
-        self.open_images_json_button.setVisible(not is_annotation)
-        self.open_images_button.setVisible(is_annotation)
-        self.open_dataset_button.setVisible(is_annotation)
+        # Standalone open buttons are superseded by the project import menu; keep
+        # them hidden (loading now flows through New/Open project + Import).
+        self.open_button.setVisible(False)
+        self.open_images_json_button.setVisible(False)
+        self.open_images_button.setVisible(False)
+        self.open_dataset_button.setVisible(False)
         self.draw_button.setVisible(is_annotation)
         self.delete_button.setVisible(is_annotation)
         self.save_all_button.setVisible(is_annotation)
@@ -2574,10 +3476,11 @@ class PyQtAnnotationReview(QMainWindow):
             self.draw_button.setChecked(not self.draw_button.isChecked())
 
     def _open_shortcut(self) -> None:
-        if self.mode == "annotation":
-            self._open_images_for_annotation()
+        # With a project open, "O" imports images; otherwise it opens a project.
+        if self.project is not None:
+            self._import_image_folder()
         else:
-            self._open_folder()
+            self._open_project()
 
     def _populate_level_classes(self) -> None:
         """Fill the sidebar with the current level's classes (grouped, single-select)."""
@@ -2711,15 +3614,25 @@ class PyQtAnnotationReview(QMainWindow):
         if category_id is None:
             return None
         out: dict = {"category_id": category_id, "iscrowd": annotation.get("iscrowd", 0)}
+        is_box_level = levels.level_geometry(level) == levels.GEOMETRY_ROTATED_BBOX
         segmentation = annotation.get("segmentation")
         bbox = annotation.get("bbox")
         if isinstance(segmentation, list) and segmentation and isinstance(segmentation[0], list) and len(segmentation[0]) >= 6:
             contour = segmentation[0]
-            out["segmentation"] = [list(contour)]
             points = [(contour[i], contour[i + 1]) for i in range(0, len(contour) - 1, 2)]
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
-            out["bbox"] = list(bbox[:4]) if (bbox and len(bbox) >= 4) else [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+            envelope = list(bbox[:4]) if (bbox and len(bbox) >= 4) else [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+            if is_box_level:
+                # A polygon class remapped to the box level becomes its envelope.
+                x, y, width, height = (float(v) for v in envelope[:4])
+                out["bbox"] = [x, y, width, height]
+                out["area"] = width * height
+                out["rotation"] = 0.0
+                out["segmentation"] = [[x, y, x + width, y, x + width, y + height, x, y + height]]
+                return out
+            out["segmentation"] = [list(contour)]
+            out["bbox"] = envelope
             out["area"] = annotation.get("area") or polygon_area(points)
             out["rotation"] = float(annotation.get("rotation", 0) or 0)
             return out
@@ -3014,11 +3927,52 @@ class PyQtAnnotationReview(QMainWindow):
             })
         return overlay_items
 
+    @staticmethod
+    def _raw_geometry_points(annotation: dict) -> list[tuple[float, float]]:
+        """Extract polygon/box points from a raw (unconverted) annotation, or []."""
+        segmentation = annotation.get("segmentation")
+        if isinstance(segmentation, list) and segmentation and isinstance(segmentation[0], list) and len(segmentation[0]) >= 6:
+            segment = segmentation[0]
+            return [(float(segment[i]), float(segment[i + 1])) for i in range(0, len(segment) - 1, 2)]
+        bbox = annotation.get("bbox")
+        if bbox and len(bbox) >= 4:
+            x, y, width, height = (float(v) for v in bbox[:4])
+            return [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+        return []
+
+    def _pending_redefine_overlays(self, level: int) -> list[dict]:
+        """Highlighted, read-only overlays for classes parked in ``level`` (Redefine)."""
+        if self.project is None:
+            return []
+        basename = self._current_image_basename()
+        if not basename:
+            return []
+        overlays: list[dict] = []
+        for entry in self.project.unmapped_entries_for_level(level):
+            if os.path.basename(str(entry.get("file_name", ""))) != basename:
+                continue
+            points = self._raw_geometry_points(entry.get("source_annotation", {}) or {})
+            if len(points) < 2:
+                continue
+            overlays.append({
+                "shape": "polygon",
+                "points": points,
+                "center": polygon_centroid(points),
+                "label": f"{entry.get('raw_class', '?')} • redefine",
+                "color": (255, 92, 196),  # distinct magenta = needs redefinition
+                "annotation": None,
+                "editable": False,
+                "pending_redefine": True,
+            })
+        return overlays
+
     def _refresh_overlay_items(self) -> None:
         if self.mode == "annotation":
             annotations = self._current_level_annotations()
             self.current_annotations = annotations
-            self.current_overlay_items = self._build_annotation_overlay_items(annotations, self.annotation_level)
+            overlays = self._build_annotation_overlay_items(annotations, self.annotation_level)
+            overlays += self._pending_redefine_overlays(self.annotation_level)
+            self.current_overlay_items = overlays
             self.canvas.set_overlay_items(self.current_overlay_items)
             self.canvas.update()
             self._update_status_labels()
@@ -3461,6 +4415,7 @@ class PyQtAnnotationReview(QMainWindow):
             self._show_message(self._unreadable_message(failed_count))
 
     def _update_status_labels(self) -> None:
+        self._refresh_canvas_placeholder()
         if self.mode == "annotation":
             active = self._active_category()
             active_name = levels.class_name_for_category(self.annotation_level, active) if active is not None else None
@@ -3478,7 +4433,7 @@ class PyQtAnnotationReview(QMainWindow):
             self.copy_id_button.setEnabled(bool(self.images))
             return
         if not self.dataset:
-            self.status_label.setText("No dataset loaded — open a zip/folder or images + JSON to begin")
+            self.status_label.setText("No images yet — use the Import menu to add some")
             self.copy_id_button.setEnabled(False)
             return
 
