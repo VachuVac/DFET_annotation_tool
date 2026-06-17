@@ -8,6 +8,8 @@ a = Analysis(
     datas=[
         ('src/assets/checkbox_checked.svg', 'assets'),
         ('src/assets/edit_icon.svg', 'assets'),
+        ('src/assets/undo_icon.svg', 'assets'),
+        ('src/assets/redo_icon.svg', 'assets'),
         ('src/class_colors.json', '.'),
         ('src/class_colors_default.json', '.'),
     ],

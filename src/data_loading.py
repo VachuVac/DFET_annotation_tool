@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import zipfile
@@ -12,15 +13,85 @@ import shutil
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def _load_json_safely(path: Path):
+    """Read and parse a JSON file, returning None if it cannot be read/parsed."""
+    try:
+        with open(path, "r", encoding="utf-8") as file_handle:
+            return json.load(file_handle)
+    except Exception:
+        return None
+
+
+def is_label_studio_export(data) -> bool:
+    """True if ``data`` is a Label Studio native export (a list of task dicts).
+
+    Distinguished from a COCO results/predictions list (also a top-level list) by
+    the per-task ``annotations`` + ``data`` keys that only Label Studio emits.
+    """
+    return (
+        isinstance(data, list)
+        and len(data) > 0
+        and isinstance(data[0], dict)
+        and "annotations" in data[0]
+        and "data" in data[0]
+    )
+
+
+def label_studio_has_rotation(data) -> bool:
+    """True if any rectangle region in a Label Studio export has a nonzero rotation."""
+    if not isinstance(data, list):
+        return False
+    for task in data:
+        if not isinstance(task, dict):
+            continue
+        for annotation in task.get("annotations", []) or []:
+            for region in annotation.get("result", []) or []:
+                if not isinstance(region, dict):
+                    continue
+                rotation = (region.get("value", {}) or {}).get("rotation", 0)
+                if abs(float(rotation or 0)) > 1e-6:
+                    return True
+    return False
+
+
+def _find_annotation_file(root_path: Path) -> Path | None:
+    """Pick the best annotation JSON under ``root_path``.
+
+    A Label Studio export that contains rotated boxes wins, because only it
+    carries the orientation; otherwise the canonical COCO ``result.json`` is
+    used, falling back to a rotation-free Label Studio export if that is all
+    there is.
+    """
+    json_files = sorted(root_path.rglob("*.json"), key=lambda path: len(path.parts))
+
+    result_files: list[Path] = []
+    label_studio_files: list[tuple[Path, bool]] = []
+    for json_file in json_files:
+        if json_file.name == "result.json":
+            result_files.append(json_file)
+        data = _load_json_safely(json_file)
+        if data is not None and is_label_studio_export(data):
+            label_studio_files.append((json_file, label_studio_has_rotation(data)))
+
+    rotated_label_studio = [path for path, has_rotation in label_studio_files if has_rotation]
+    if rotated_label_studio:
+        return rotated_label_studio[0]
+    if result_files:
+        return result_files[0]
+    if label_studio_files:
+        return label_studio_files[0][0]
+    return None
+
+
 def find_coco_paths(search_root: str) -> tuple[str, str]:
-    """Find COCO annotation and image directories."""
+    """Find the annotation file and image directory in a COCO/Label Studio export."""
     root_path = Path(search_root)
 
-    result_candidates = sorted(root_path.rglob("result.json"), key=lambda path: len(path.parts))
-    if not result_candidates:
-        raise FileNotFoundError("Could not find result.json in selected input.")
-
-    annotations_path = result_candidates[0]
+    annotations_path = _find_annotation_file(root_path)
+    if annotations_path is None:
+        raise FileNotFoundError(
+            "Could not find result.json or a Label Studio export JSON in selected input."
+        )
 
     images_candidate = annotations_path.parent / "images"
     if not images_candidate.is_dir():
@@ -146,12 +217,98 @@ def _parse_coco_results(annotations_list: list, images_path: str):
     return images, images_by_id, annotations_by_image_id, categories_by_id
 
 
+def _rotated_rectangle_corners(x: float, y: float, width: float, height: float, rotation_deg: float):
+    """Corners of a rectangle rotated clockwise around its top-left corner (x, y).
+
+    Returns top-left, top-right, bottom-right, bottom-left in image pixels.
+    """
+    angle = math.radians(rotation_deg)
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    local = [(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]
+    return [(x + dx * cos_a - dy * sin_a, y + dx * sin_a + dy * cos_a) for dx, dy in local]
+
+
+def _parse_label_studio(tasks: list):
+    """Build dataset metadata from a Label Studio native export.
+
+    Each rectangle region (``rectanglelabels``) becomes an annotation whose
+    ``segmentation`` is the rotated 4-corner quad, so oriented boxes render
+    through the existing polygon pipeline. ``bbox`` is the axis-aligned envelope.
+    Coordinates in the export are percentages of the image; rotation is in
+    degrees clockwise around the box's top-left corner.
+    """
+    images: list[dict] = []
+    images_by_id: dict[int, dict] = {}
+    annotations_by_image_id: dict[int, list] = defaultdict(list)
+    name_to_category_id: dict[str, int] = {}
+    annotation_id = 0
+
+    for image_id, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        image_reference = (task.get("data", {}) or {}).get("image") or task.get("file_upload") or ""
+        file_name = os.path.basename(str(image_reference).replace("\\", "/"))
+
+        regions = [
+            region
+            for annotation in (task.get("annotations", []) or [])
+            for region in (annotation.get("result", []) or [])
+            if isinstance(region, dict) and region.get("type") == "rectanglelabels"
+        ]
+
+        width = regions[0].get("original_width") if regions else None
+        height = regions[0].get("original_height") if regions else None
+        images.append({"id": image_id, "file_name": file_name, "width": width, "height": height})
+        images_by_id[image_id] = images[-1]
+
+        if not width or not height:
+            continue
+
+        for region in regions:
+            value = region.get("value", {}) or {}
+            labels = value.get("rectanglelabels") or []
+            if not labels:
+                continue
+            name = labels[0]
+            if name not in name_to_category_id:
+                name_to_category_id[name] = len(name_to_category_id)
+
+            box_x = float(value.get("x", 0.0)) / 100.0 * width
+            box_y = float(value.get("y", 0.0)) / 100.0 * height
+            box_w = float(value.get("width", 0.0)) / 100.0 * width
+            box_h = float(value.get("height", 0.0)) / 100.0 * height
+            rotation = float(value.get("rotation", 0.0) or 0.0)
+
+            corners = _rotated_rectangle_corners(box_x, box_y, box_w, box_h, rotation)
+            xs = [corner[0] for corner in corners]
+            ys = [corner[1] for corner in corners]
+            annotations_by_image_id[image_id].append(
+                {
+                    "id": annotation_id,
+                    "image_id": image_id,
+                    "category_id": name_to_category_id[name],
+                    "segmentation": [[coord for corner in corners for coord in corner]],
+                    "bbox": [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)],
+                    "area": box_w * box_h,
+                    "rotation": rotation,
+                    "iscrowd": 0,
+                    "ignore": 0,
+                }
+            )
+            annotation_id += 1
+
+    categories_by_id = {category_id: name for name, category_id in name_to_category_id.items()}
+    return images, images_by_id, annotations_by_image_id, categories_by_id
+
+
 def load_coco_data(annotations_path: str, images_path: str | None = None):
-    """Load annotation data from a COCO dict file or a COCO results list file."""
+    """Load annotations from a COCO dict, COCO results list, or Label Studio export."""
     with open(annotations_path, "r", encoding="utf-8") as file_handle:
         coco_data = json.load(file_handle)
 
     if isinstance(coco_data, list):
+        if is_label_studio_export(coco_data):
+            return _parse_label_studio(coco_data)
         if not images_path:
             raise ValueError(
                 "This JSON is a COCO results/predictions list with no image names. "
