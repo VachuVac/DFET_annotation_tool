@@ -5,6 +5,7 @@ from __future__ import annotations
 import colorsys
 import copy
 import json
+import math
 import os
 import shutil
 import sys
@@ -12,12 +13,16 @@ from pathlib import Path
 
 from .constants import DPI_SCALE, MONITOR_HEIGHT, MONITOR_WIDTH, SIDEBAR_WIDTH
 from .data_loading import (
+    find_coco_paths,
+    load_coco_data,
     load_dataset_from_folder_and_json,
     load_dataset_from_input,
+    load_images_only,
     resolve_image_path,
 )
 from .rle import is_rle_segmentation, rle_to_polygons
 from .utils import parse_arguments
+from . import levels
 
 try:
     from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, pyqtSignal
@@ -40,6 +45,7 @@ try:
     from PyQt6.QtWidgets import (
         QAbstractItemView,
         QApplication,
+        QButtonGroup,
         QCheckBox,
         QColorDialog,
         QComboBox,
@@ -151,9 +157,13 @@ def save_shortcut_config(bindings: dict[str, str]) -> None:
         pass
 
 
-def color_for_class(category_name: str, category_id: int) -> QColor:
-    """Return the configured hex color for a class name, or generate one from the category ID."""
-    hex_color = _COLOR_CONFIG.get(category_name)
+def color_for_class(category_name: str, category_id: int, default_hex: str | None = None) -> QColor:
+    """Return the configured hex color for a class name.
+
+    Precedence: a user override in ``class_colors.json`` first, then ``default_hex``
+    (e.g. the annotation-level catalog color), then a color generated from the id.
+    """
+    hex_color = _COLOR_CONFIG.get(category_name) or default_hex
     if hex_color:
         color = QColor(hex_color)
         if color.isValid():
@@ -171,6 +181,19 @@ def polygon_centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
     return total_x / count, total_y / count
 
 
+def polygon_area(points: list[tuple[float, float]]) -> float:
+    """Shoelace area of a polygon given its vertices."""
+    count = len(points)
+    if count < 3:
+        return 0.0
+    running = 0.0
+    for index in range(count):
+        x1, y1 = points[index]
+        x2, y2 = points[(index + 1) % count]
+        running += x1 * y2 - x2 * y1
+    return abs(running) / 2.0
+
+
 def resource_path(*parts: str) -> Path:
     """Resolve a bundled resource path in both source and frozen runs."""
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -183,6 +206,11 @@ class ImageCanvas(QWidget):
     # Emitted after a vertex drag finishes with a before/after edit record (a dict),
     # so the window can mark unsaved edits and push an undo step.
     annotationsChanged = pyqtSignal(object)
+    # Emitted when a new shape is drawn: {"shape": "polygon"|"bbox", "points": [(x, y), ...]}
+    # in image coordinates. The window turns it into an annotation for the active level.
+    annotationCreated = pyqtSignal(object)
+    # Emitted when the selected annotation changes (so the window can enable Delete).
+    selectionChanged = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -206,6 +234,19 @@ class ImageCanvas(QWidget):
         self._hover_vertex: tuple[dict, int] | None = None
         self._handle_size = max(3, int(round(4 * DPI_SCALE)))
         self._handle_hit_radius = max(9, int(round(11 * DPI_SCALE)))
+        # Drawing state (annotation mode). None = not drawing.
+        self._draw_shape: str | None = None  # "polygon" | "bbox"
+        self._draw_color: tuple[int, int, int] = (255, 255, 255)
+        self._poly_points: list[tuple[float, float]] = []
+        # Box drawing is click-based: click start, click end (axis-aligned). Hold Shift
+        # on the second click to instead define a center line, then a 3rd click for thickness.
+        self._box_pts: list[tuple[float, float]] = []
+        self._box_rotated = False
+        self._box_shift_preview = False
+        self._cursor_image: tuple[float, float] | None = None
+        # Selection (annotation mode): click an annotation body to select; Delete removes it.
+        self._select_enabled = False
+        self._selected_annotation: dict | None = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -329,6 +370,7 @@ class ImageCanvas(QWidget):
         painter.drawPixmap(image_x, image_y, scaled_pixmap)
         self._draw_overlays(painter, image_x, image_y)
         self._draw_handles(painter, image_x, image_y)
+        self._draw_pending(painter, image_x, image_y)
 
         title_font = QFont()
         title_font.setPointSizeF(max(9.0, 9.0 * DPI_SCALE))
@@ -346,12 +388,118 @@ class ImageCanvas(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
-    def _image_from_screen(self, screen_x: float, screen_y: float) -> tuple[float, float]:
-        """Convert a screen position back into image (pixel) coordinates."""
+    # ----- drawing (annotation mode) --------------------------------------
+    def set_draw_shape(self, shape: str | None, color: tuple[int, int, int] = (255, 255, 255)) -> None:
+        """Arm drawing of ``shape`` ("polygon"|"bbox") with ``color``; None disarms."""
+        self._draw_shape = shape
+        self._draw_color = color
+        self.cancel_drawing()
+        self.setCursor(Qt.CursorShape.CrossCursor if shape else Qt.CursorShape.ArrowCursor)
+
+    def has_pending_drawing(self) -> bool:
+        return bool(self._poly_points) or bool(self._box_pts)
+
+    def cancel_drawing(self) -> None:
+        self._poly_points = []
+        self._box_pts = []
+        self._box_rotated = False
+        self._cursor_image = None
+        self.update()
+
+    @staticmethod
+    def _oriented_box(p1, p2, p3) -> tuple[list[tuple[float, float]] | None, float]:
+        """Rectangle with one edge p1->p2 and the opposite edge through p3.
+
+        Returns (corners, rotation_degrees). p1->p2 is one long side; p3's signed
+        perpendicular distance from that line sets the thickness and side.
+        """
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return None, 0.0
+        nx, ny = -dy / length, dx / length  # unit perpendicular
+        offset = (p3[0] - p1[0]) * nx + (p3[1] - p1[1]) * ny
+        tx, ty = nx * offset, ny * offset
+        corners = [p1, p2, (p2[0] + tx, p2[1] + ty), (p1[0] + tx, p1[1] + ty)]
+        return corners, math.degrees(math.atan2(dy, dx))
+
+    def remove_last_point(self) -> None:
+        if self._poly_points:
+            self._poly_points.pop()
+            self.update()
+
+    def finish_polygon(self) -> None:
+        if self._draw_shape == "polygon" and len(self._poly_points) >= 3:
+            points = list(self._poly_points)
+            self._poly_points = []
+            self._cursor_image = None
+            self.update()
+            self.annotationCreated.emit({"shape": "polygon", "points": points})
+
+    def _near_first_point(self, position) -> bool:
+        if not self._poly_points:
+            return False
+        image_x, image_y, _, _ = self._fit_display_rect()
+        first_x, first_y = self._poly_points[0]
+        screen_x = image_x + first_x * self._zoom
+        screen_y = image_y + first_y * self._zoom
+        return (screen_x - position.x()) ** 2 + (screen_y - position.y()) ** 2 <= float(self._handle_hit_radius) ** 2
+
+    # ----- selection (annotation mode) ------------------------------------
+    def set_select_enabled(self, enabled: bool) -> None:
+        self._select_enabled = enabled
+        if not enabled:
+            self._set_selected(None)
+        self.update()
+
+    def selected_annotation(self) -> dict | None:
+        return self._selected_annotation
+
+    def clear_selection(self) -> None:
+        self._set_selected(None)
+
+    def _set_selected(self, annotation: dict | None) -> None:
+        if annotation is not self._selected_annotation:
+            self._selected_annotation = annotation
+            self.selectionChanged.emit()
+            self.update()
+
+    def _hit_test_annotation(self, position) -> dict | None:
+        """Return the topmost annotation whose shape contains the cursor, if any."""
+        if self._pixmap is None:
+            return None
+        image_x, image_y, _, _ = self._fit_display_rect()
+        target = QPointF(position.x(), position.y())
+        for item in reversed(self._overlay_items):
+            points = item.get("points") or []
+            if len(points) < 2:
+                continue
+            screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in points]
+            if item.get("shape") == "bbox":
+                xs = [p.x() for p in screen_points]
+                ys = [p.y() for p in screen_points]
+                if QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).contains(target):
+                    return item.get("annotation")
+            elif QPolygonF(screen_points).containsPoint(target, Qt.FillRule.OddEvenFill):
+                return item.get("annotation")
+        return None
+
+    def _image_from_screen(self, screen_x: float, screen_y: float, clamp: bool = False) -> tuple[float, float]:
+        """Convert a screen position back into image (pixel) coordinates.
+
+        When ``clamp`` is set, the result is confined to the image rectangle so a
+        click/drag outside the picture lands on the nearest edge rather than in
+        empty space. The cursor itself moves freely; only the point is pinned.
+        """
         image_x, image_y, _, _ = self._fit_display_rect()
         if self._zoom <= 0:
             return 0.0, 0.0
-        return (screen_x - image_x) / self._zoom, (screen_y - image_y) / self._zoom
+        ix = (screen_x - image_x) / self._zoom
+        iy = (screen_y - image_y) / self._zoom
+        if clamp and self._pixmap is not None:
+            ix = min(max(ix, 0.0), float(self._pixmap.width()))
+            iy = min(max(iy, 0.0), float(self._pixmap.height()))
+        return ix, iy
 
     def _hit_test_vertex(self, position) -> tuple[dict, int] | None:
         """Return (overlay_item, vertex_index) of the editable handle under the cursor, if any."""
@@ -454,6 +602,66 @@ class ImageCanvas(QWidget):
                 painter.setBrush(QColor(106, 114, 230) if hovered else QColor(255, 255, 255))
                 painter.drawRect(QRectF(screen_x - radius, screen_y - radius, radius * 2, radius * 2))
 
+    def _draw_pending(self, painter: QPainter, image_x: int, image_y: int) -> None:
+        """Render the in-progress drawn shape (rubber band) on top of everything."""
+        if self._draw_shape is None or self._pixmap is None:
+            return
+        color = QColor(*self._draw_color)
+        pen = QPen(color, max(1.5, 1.6 * DPI_SCALE))
+        pen.setStyle(Qt.PenStyle.DashLine)
+
+        if self._draw_shape == "bbox":
+            fill = QColor(color)
+            fill.setAlpha(55)
+            radius = self._handle_size
+            cursor = self._cursor_image
+
+            def to_screen(pt):
+                return QPointF(image_x + pt[0] * self._zoom, image_y + pt[1] * self._zoom)
+
+            if len(self._box_pts) == 1 and cursor is not None:
+                first = self._box_pts[0]
+                if self._box_shift_preview:
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawLine(to_screen(first), to_screen(cursor))
+                else:
+                    start = to_screen(first)
+                    end = to_screen(cursor)
+                    painter.setPen(pen)
+                    painter.setBrush(fill)
+                    painter.drawRect(QRectF(min(start.x(), end.x()), min(start.y(), end.y()), abs(end.x() - start.x()), abs(end.y() - start.y())))
+            elif len(self._box_pts) == 2 and cursor is not None:
+                corners, _ = self._oriented_box(self._box_pts[0], self._box_pts[1], cursor)
+                if corners is not None:
+                    painter.setPen(pen)
+                    painter.setBrush(fill)
+                    painter.drawPolygon(QPolygonF([to_screen(pt) for pt in corners]))
+
+            painter.setPen(QPen(QColor(20, 20, 20), 1))
+            painter.setBrush(QColor(255, 255, 255))
+            for pt in self._box_pts:
+                painter.drawEllipse(to_screen(pt), radius, radius)
+            return
+
+        if self._draw_shape == "polygon" and self._poly_points:
+            screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in self._poly_points]
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if len(screen_points) >= 2:
+                painter.drawPolyline(QPolygonF(screen_points))
+            if self._cursor_image is not None:
+                cursor_point = QPointF(image_x + self._cursor_image[0] * self._zoom, image_y + self._cursor_image[1] * self._zoom)
+                painter.drawLine(screen_points[-1], cursor_point)
+            radius = self._handle_size
+            painter.setPen(QPen(QColor(20, 20, 20), 1))
+            painter.setBrush(QColor(255, 255, 255))
+            for point in screen_points:
+                painter.drawEllipse(point, radius, radius)
+            if len(screen_points) >= 3:
+                painter.setBrush(QColor(106, 114, 230))
+                painter.drawEllipse(screen_points[0], radius + 2, radius + 2)
+
     def _draw_overlays(self, painter: QPainter, image_x: int, image_y: int) -> None:
         if not self._overlay_items:
             return
@@ -476,7 +684,11 @@ class ImageCanvas(QWidget):
             points = item["points"]
             screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in points]
 
-            painter.setPen(QPen(outline_color, max(1.0, 1.2 * DPI_SCALE)))
+            is_selected = self._selected_annotation is not None and item.get("annotation") is self._selected_annotation
+            if is_selected:
+                painter.setPen(QPen(QColor(255, 255, 255), max(2.0, 2.4 * DPI_SCALE)))
+            else:
+                painter.setPen(QPen(outline_color, max(1.0, 1.2 * DPI_SCALE)))
             painter.setBrush(fill_color)
 
             if item["shape"] == "polygon":
@@ -559,8 +771,32 @@ class ImageCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        # Middle button always pans (handy while drawing, where left is the pen).
+        if event.button() == Qt.MouseButton.MiddleButton and self._pixmap is not None:
+            self._dragging = True
+            self._drag_start = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
-            # Grabbing a handle edits a vertex; otherwise the drag pans the image.
+            # Drawing takes precedence over panning/editing when armed.
+            if self._draw_shape is not None and self._pixmap is not None:
+                # Drawing points are pinned to the image so nothing lands off-picture.
+                image_x, image_y = self._image_from_screen(event.position().x(), event.position().y(), clamp=True)
+                if self._draw_shape == "polygon":
+                    if len(self._poly_points) >= 3 and self._near_first_point(event.position()):
+                        self.finish_polygon()
+                    else:
+                        self._poly_points.append((image_x, image_y))
+                        self.update()
+                    return
+                # bbox: click start, click end (axis-aligned); Shift on the 2nd click
+                # defines a center line, then a 3rd click sets the thickness (rotated).
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                self._handle_box_click((image_x, image_y), shift)
+                return
+
+            # Grabbing a handle edits a vertex (only when editing is enabled).
             hit = self._hit_test_vertex(event.position())
             if hit is not None:
                 self._drag_vertex = hit
@@ -569,13 +805,27 @@ class ImageCanvas(QWidget):
                 self._dragging = False
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 return
+            # Clicking an annotation body selects it; empty space deselects, then pans.
+            if self._select_enabled:
+                annotation = self._hit_test_annotation(event.position())
+                if annotation is not None:
+                    self._set_selected(annotation)
+                    return
+                self._set_selected(None)
             self._dragging = True
             self._drag_start = event.position().toPoint()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if self._draw_shape == "polygon" and len(self._poly_points) >= 3:
+            self.finish_polygon()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._drag_vertex is not None:
             item, index = self._drag_vertex
-            image_x, image_y = self._image_from_screen(event.position().x(), event.position().y())
+            image_x, image_y = self._image_from_screen(event.position().x(), event.position().y(), clamp=True)
             self._apply_vertex_drag(item, index, image_x, image_y)
             self._vertex_moved = True
             self.update()
@@ -590,10 +840,54 @@ class ImageCanvas(QWidget):
             self.update()
             return
 
+        if self._draw_shape is not None and self._pixmap is not None:
+            # Preview cursor is clamped too, so the rubber-band matches the pinned point.
+            self._cursor_image = self._image_from_screen(event.position().x(), event.position().y(), clamp=True)
+            if self._draw_shape == "bbox" and len(self._box_pts) == 1:
+                # Live feedback: Shift previews the rotated center line, else an axis box.
+                self._box_shift_preview = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self.update()
+            return
+
         self._update_hover(event.position())
 
+    def _handle_box_click(self, point: tuple[float, float], shift: bool) -> None:
+        """Advance the click-based box state machine and emit when a box completes."""
+        if not self._box_pts:
+            self._box_pts = [point]
+            self._cursor_image = point
+        elif len(self._box_pts) == 1:
+            if shift:
+                # Shift on the 2nd click: this is the center-line end; await thickness.
+                self._box_pts.append(point)
+                self._box_rotated = True
+            else:
+                p1 = self._box_pts[0]
+                self._box_pts = []
+                if abs(point[0] - p1[0]) >= 2 and abs(point[1] - p1[1]) >= 2:
+                    corners = [(p1[0], p1[1]), (point[0], p1[1]), (point[0], point[1]), (p1[0], point[1])]
+                    self.annotationCreated.emit({"shape": "bbox", "points": corners})
+        elif len(self._box_pts) == 2 and self._box_rotated:
+            corners, rotation = self._oriented_box(self._box_pts[0], self._box_pts[1], point)
+            self._box_pts = []
+            self._box_rotated = False
+            if corners is not None:
+                self.annotationCreated.emit({"shape": "obbox", "points": corners, "rotation": rotation})
+        self.update()
+
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.CrossCursor if self._draw_shape else Qt.CursorShape.ArrowCursor)
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
+            # Box/polygon drawing is click-driven; nothing to settle on release.
+            if self._draw_shape is not None:
+                self._dragging = False
+                self.setCursor(Qt.CursorShape.CrossCursor)
+                return
+
             annotation = self._drag_vertex[0].get("annotation") if self._drag_vertex is not None else None
             edited = self._drag_vertex is not None and self._vertex_moved and annotation is not None
             before = self._drag_before
@@ -1121,6 +1415,19 @@ class PyQtAnnotationReview(QMainWindow):
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
 
+        # Validation (review) vs annotation (draw) mode. Validation is the default tool.
+        self.mode = "validation"
+        self.annotation_level = levels.LEVEL_IDS[0]
+        # Per-level "active" drawing class id (single-select). None = nothing selected.
+        self.active_category_by_level: dict[int, int | None] = {lvl: None for lvl in levels.LEVEL_IDS}
+        # Annotation-mode stores: level -> {image basename -> [annotation dicts]}.
+        # Keyed by basename so they survive id-scheme changes across sessions.
+        self.annotation_store: dict[int, dict[str, list]] = {lvl: {} for lvl in levels.LEVEL_IDS}
+        # Folder the per-level COCO JSON files live in (the images folder's parent pick).
+        self.annotation_root = ""
+        # Each mode keeps its own loaded session so toggling doesn't lose work.
+        self._sessions: dict[str, dict] = {}
+
         self.dataset = None
         self.temp_extraction = None
         self.images_path = ""
@@ -1133,6 +1440,14 @@ class PyQtAnnotationReview(QMainWindow):
         self.current_category_ids: list[int] = []
         self.visible_by_category: dict[int, bool] = {}
         self.class_checkboxes: dict[int, ClassBubbleButton] = {}
+        # Current-image working state (set when an image loads; defaulted so mode
+        # switching is safe before any dataset/images are opened).
+        self.index = 0
+        self.current_annotations: list = []
+        self.current_overlay_items: list[dict] = []
+        self.current_image_name = ""
+        self.current_image_path = ""
+        self.has_polygons = False
         # Cache of decoded RLE polygons keyed by id(annotation); decoding full
         # masks is expensive and overlays rebuild on every class toggle.
         self._rle_polygon_cache: dict[int, list[list[float]]] = {}
@@ -1140,6 +1455,8 @@ class PyQtAnnotationReview(QMainWindow):
         self._build_ui()
         self._apply_styles()
         self.canvas.annotationsChanged.connect(self._on_annotations_changed)
+        self.canvas.annotationCreated.connect(self._on_annotation_created)
+        self.canvas.selectionChanged.connect(self._on_selection_changed)
 
         self._init_shortcuts()
 
@@ -1163,7 +1480,12 @@ class PyQtAnnotationReview(QMainWindow):
             ("undo", "Undo", "Ctrl+Z", [], self._undo),
             ("redo", "Redo", "Ctrl+Y", ["Ctrl+Shift+Z"], self._redo),
             ("save", "Save", "Ctrl+S", [], self._save_dataset),
-            ("open", "Open", "O", [], self._open_folder),
+            ("open", "Open", "O", [], self._open_shortcut),
+            ("toggle_mode", "Switch validation/annotate", "M", [], self._toggle_mode),
+            ("toggle_draw", "Toggle draw (annotate)", "D", [], self._toggle_draw_shortcut),
+            ("level_1", "Annotate level 1", "1", [], lambda: self._shortcut_level(1)),
+            ("level_2", "Annotate level 2", "2", [], lambda: self._shortcut_level(2)),
+            ("level_3", "Annotate level 3", "3", [], lambda: self._shortcut_level(3)),
             ("quit", "Quit", "Q", ["Esc"], self.close),
         ]
         self._shortcut_order = [d[0] for d in defs]
@@ -1274,6 +1596,53 @@ class PyQtAnnotationReview(QMainWindow):
         subtitle = QLabel("COCO box & polygon editor")
         subtitle.setObjectName("muted")
         sidebar_layout.addWidget(subtitle)
+
+        # ----- Mode toggle: Validation (review) vs Annotate (draw) -----
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(6)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.validation_mode_button = QPushButton("Validation")
+        self.validation_mode_button.setObjectName("toggleButton")
+        self.validation_mode_button.setCheckable(True)
+        self.validation_mode_button.setChecked(True)
+        self.validation_mode_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.validation_mode_button.setToolTip("Review existing annotations (read/edit)")
+        self.validation_mode_button.clicked.connect(lambda: self._set_mode("validation"))
+        self.annotation_mode_button = QPushButton("Annotate")
+        self.annotation_mode_button.setObjectName("toggleButton")
+        self.annotation_mode_button.setCheckable(True)
+        self.annotation_mode_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.annotation_mode_button.setToolTip("Draw new annotations per level")
+        self.annotation_mode_button.clicked.connect(lambda: self._set_mode("annotation"))
+        self.mode_group.addButton(self.validation_mode_button)
+        self.mode_group.addButton(self.annotation_mode_button)
+        mode_row.addWidget(self.validation_mode_button, 1)
+        mode_row.addWidget(self.annotation_mode_button, 1)
+        sidebar_layout.addLayout(mode_row)
+
+        # ----- Level selector (annotation mode only) -----
+        self.level_selector_widget = QWidget()
+        level_row = QHBoxLayout(self.level_selector_widget)
+        level_row.setContentsMargins(0, 0, 0, 0)
+        level_row.setSpacing(6)
+        self.level_group = QButtonGroup(self)
+        self.level_group.setExclusive(True)
+        self.level_buttons: dict[int, QPushButton] = {}
+        for level_id in levels.LEVEL_IDS:
+            level_button = QPushButton(f"L{level_id}")
+            level_button.setObjectName("toggleButton")
+            level_button.setCheckable(True)
+            level_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            level_button.setToolTip(f"Level {level_id} — {levels.level_title(level_id)}")
+            level_button.clicked.connect(lambda _checked=False, lvl=level_id: self._set_level(lvl))
+            self.level_group.addButton(level_button)
+            self.level_buttons[level_id] = level_button
+            level_row.addWidget(level_button, 1)
+        self.level_buttons[self.annotation_level].setChecked(True)
+        sidebar_layout.addWidget(self.level_selector_widget)
+        self.level_selector_widget.setVisible(False)
 
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
@@ -1415,6 +1784,20 @@ class PyQtAnnotationReview(QMainWindow):
         self.open_images_json_button.clicked.connect(self._open_images_and_json)
         sidebar_layout.addWidget(self.open_images_json_button)
 
+        # Annotation-mode entry: pick an images folder (resumes per-level JSONs if present).
+        self.open_images_button = QPushButton("Open images")
+        self.open_images_button.setToolTip("Pick an images folder to annotate (loads existing per-level JSONs if found)")
+        self.open_images_button.clicked.connect(self._open_images_for_annotation)
+        self.open_images_button.setVisible(False)
+        sidebar_layout.addWidget(self.open_images_button)
+
+        # Annotation-mode entry: convert an existing COCO dataset into the 3 levels.
+        self.open_dataset_button = QPushButton("Open dataset (convert)")
+        self.open_dataset_button.setToolTip("Load an existing COCO dataset folder and sort its annotations into the 3 levels by class name")
+        self.open_dataset_button.clicked.connect(self._open_dataset_for_annotation)
+        self.open_dataset_button.setVisible(False)
+        sidebar_layout.addWidget(self.open_dataset_button)
+
         self.save_button = QPushButton("Save")
         self.save_button.setObjectName("primaryButton")
         self.save_button.setToolTip("Save annotations to a COCO JSON file (Ctrl+S)")
@@ -1427,8 +1810,15 @@ class PyQtAnnotationReview(QMainWindow):
         self.copy_id_button.setEnabled(False)
         self.copy_id_button.clicked.connect(self._copy_image_id)
 
+        self.save_all_button = QPushButton("Save all")
+        self.save_all_button.setToolTip("Save all three levels' COCO JSON files")
+        self.save_all_button.setEnabled(False)
+        self.save_all_button.setVisible(False)
+        self.save_all_button.clicked.connect(self._save_all_levels)
+
         save_row = QHBoxLayout()
         save_row.addWidget(self.save_button, 1)
+        save_row.addWidget(self.save_all_button)
         save_row.addWidget(self.copy_id_button)
         sidebar_layout.addLayout(save_row)
 
@@ -1453,12 +1843,30 @@ class PyQtAnnotationReview(QMainWindow):
         opacity_row.addWidget(self.opacity_value_label)
         sidebar_layout.addLayout(opacity_row)
 
+        self.draw_button = QPushButton("Draw")
+        self.draw_button.setObjectName("toggleButton")
+        self.draw_button.setCheckable(True)
+        self.draw_button.setChecked(False)
+        self.draw_button.setToolTip("Draw new annotations with the selected class (pan with middle mouse)")
+        self.draw_button.setVisible(False)
+        self.draw_button.toggled.connect(self._on_draw_toggled)
+
         self.edit_objects_button = QPushButton("Edit objects")
         self.edit_objects_button.setObjectName("toggleButton")
         self.edit_objects_button.setCheckable(True)
         self.edit_objects_button.setChecked(False)
         self.edit_objects_button.setToolTip("Toggle editing of box corners / polygon vertices (T)")
         self.edit_objects_button.toggled.connect(self._on_edit_objects_toggled)
+
+        self.delete_button = QPushButton("✕")  # white cross
+        self.delete_button.setObjectName("dangerButton")
+        self.delete_button.setToolTip("Delete the selected annotation (Del)")
+        self.delete_button.setEnabled(False)
+        self.delete_button.setVisible(False)
+        delete_side = int(round(30 * DPI_SCALE))
+        self.delete_button.setFixedSize(delete_side, delete_side)
+        self.delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_button.clicked.connect(self._delete_selected_annotation)
 
         self.labels_checkbox = QCheckBox("Show labels")
         self.labels_checkbox.setChecked(True)
@@ -1467,7 +1875,10 @@ class PyQtAnnotationReview(QMainWindow):
         self.reset_colors_button.clicked.connect(self._reset_colors_to_default)
 
         toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(6)
+        toggle_row.addWidget(self.draw_button)
         toggle_row.addWidget(self.edit_objects_button)
+        toggle_row.addWidget(self.delete_button)
         toggle_row.addWidget(self.labels_checkbox)
         toggle_row.addStretch()
         toggle_row.addWidget(self.reset_colors_button)
@@ -1488,7 +1899,9 @@ class PyQtAnnotationReview(QMainWindow):
         self.class_scroll.setObjectName("classScroll")
         sidebar_layout.addWidget(self.class_scroll, 1)
 
-        class_action_row = QHBoxLayout()
+        self.class_action_widget = QWidget()
+        class_action_row = QHBoxLayout(self.class_action_widget)
+        class_action_row.setContentsMargins(0, 0, 0, 0)
         self.show_all_button = QPushButton("Show all")
         self.show_all_button.clicked.connect(self._show_all_classes)
         class_action_row.addWidget(self.show_all_button)
@@ -1496,7 +1909,7 @@ class PyQtAnnotationReview(QMainWindow):
         self.hide_all_button = QPushButton("Hide all")
         self.hide_all_button.clicked.connect(self._hide_all_classes)
         class_action_row.addWidget(self.hide_all_button)
-        sidebar_layout.addLayout(class_action_row)
+        sidebar_layout.addWidget(self.class_action_widget)
 
         self.status_label = QLabel("No dataset loaded")
         self.status_label.setObjectName("statusBarLabel")
@@ -1618,6 +2031,9 @@ class PyQtAnnotationReview(QMainWindow):
             QPushButton#primaryButton:hover {{
                 background: #7780f0;
             }}
+            QPushButton#toggleButton {{
+                padding: 5px 9px;
+            }}
             QPushButton#toggleButton:checked {{
                 background: #6a72e6;
                 border: 1px solid #8088ff;
@@ -1626,6 +2042,26 @@ class PyQtAnnotationReview(QMainWindow):
             }}
             QPushButton#toggleButton:checked:hover {{
                 background: #7780f0;
+            }}
+            QPushButton#dangerButton {{
+                background: #c0392b;
+                border: 1px solid #e05545;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 0px;
+                font-size: {max(11, int(round(12 * DPI_SCALE)))}pt;
+                font-weight: 700;
+            }}
+            QPushButton#dangerButton:hover {{
+                background: #d24433;
+            }}
+            QPushButton#dangerButton:pressed {{
+                background: #a32f23;
+            }}
+            QPushButton#dangerButton:disabled {{
+                background: #4a3330;
+                border: 1px solid #5a3b38;
+                color: #8a6f6c;
             }}
             QPushButton#iconButton {{
                 background: #505662;
@@ -1950,7 +2386,36 @@ class PyQtAnnotationReview(QMainWindow):
 
     def _on_edit_objects_toggled(self, checked: bool) -> None:
         """Enable/disable dragging of box corners and polygon vertices."""
+        if checked and self.draw_button.isChecked():
+            self.draw_button.setChecked(False)  # editing and drawing are exclusive
         self.canvas.set_edit_enabled(checked)
+
+    def _on_draw_toggled(self, checked: bool) -> None:
+        """Arm/disarm drawing new annotations with the active class."""
+        if checked:
+            if self.edit_objects_button.isChecked():
+                self.edit_objects_button.setChecked(False)
+            if self._active_category() is None:
+                self.draw_button.setChecked(False)
+                self._show_message("Pick a class first, then turn on Draw.")
+                return
+        self._sync_draw_state()
+
+    def _sync_draw_state(self) -> None:
+        """Tell the canvas what (if anything) to draw, based on mode/level/active class."""
+        if self.mode != "annotation" or not self.draw_button.isChecked():
+            self.canvas.set_draw_shape(None)
+            return
+        active = self._active_category()
+        if active is None:
+            self.canvas.set_draw_shape(None)
+            return
+        class_name = levels.class_name_for_category(self.annotation_level, active)
+        default_hex = levels.level_class_colors(self.annotation_level).get(str(class_name))
+        color = color_for_class(str(class_name), int(active), default_hex)
+        geometry = levels.level_geometry(self.annotation_level)
+        shape = "polygon" if geometry == levels.GEOMETRY_POLYGON else "bbox"
+        self.canvas.set_draw_shape(shape, (color.red(), color.green(), color.blue()))
 
     def _on_labels_toggled(self, state: int) -> None:
         self.show_labels = state == int(Qt.CheckState.Checked.value)
@@ -1986,6 +2451,336 @@ class PyQtAnnotationReview(QMainWindow):
                 bubble.blockSignals(False)
                 bubble._refresh_style()  # Manually refresh visual style
         self._refresh_overlay_items()
+
+    # ----- mode + level (validation vs annotation) ------------------------
+    # Per-mode session state (each mode keeps its own loaded data on toggle).
+    _SESSION_KEYS = (
+        "dataset", "temp_extraction", "images_path", "images", "index",
+        "annotations_by_image_id", "categories_by_id", "class_items", "category_ids",
+        "current_category_ids", "current_class_items", "current_annotations",
+        "current_overlay_items", "current_image_name", "current_image_path",
+        "visible_by_category", "has_polygons", "annotation_store", "annotation_root",
+        "_undo_stack", "_redo_stack", "_dirty",
+    )
+
+    def _snapshot_session(self) -> dict:
+        return {key: getattr(self, key, None) for key in self._SESSION_KEYS}
+
+    def _restore_session(self, snapshot: dict) -> None:
+        for key in self._SESSION_KEYS:
+            setattr(self, key, snapshot.get(key))
+
+    def _reset_session_state(self) -> None:
+        self.dataset = None
+        self.temp_extraction = None
+        self.images_path = ""
+        self.images = []
+        self.index = 0
+        self.annotations_by_image_id = {}
+        self.categories_by_id = {}
+        self.class_items = []
+        self.category_ids = []
+        self.current_category_ids = []
+        self.current_class_items = []
+        self.current_annotations = []
+        self.current_overlay_items = []
+        self.current_image_name = ""
+        self.current_image_path = ""
+        self.visible_by_category = {}
+        self.has_polygons = False
+        self.annotation_store = {lvl: {} for lvl in levels.LEVEL_IDS}
+        self.annotation_root = ""
+        self._undo_stack = []
+        self._redo_stack = []
+        self._dirty = False
+
+    def _set_mode(self, mode: str) -> None:
+        """Switch between validation (review) and annotation (draw); each keeps its own session."""
+        if mode not in ("validation", "annotation"):
+            return
+        if mode != self.mode:
+            # Stash the current session and restore (or start fresh) the target one.
+            self.canvas.cancel_drawing()
+            self.canvas.clear_selection()
+            self._sessions[self.mode] = self._snapshot_session()
+            if mode in self._sessions:
+                self._restore_session(self._sessions[mode])
+            else:
+                self._reset_session_state()
+            self._rle_polygon_cache.clear()
+        self.mode = mode
+        is_annotation = mode == "annotation"
+        # Keep the toggle buttons in sync (also covers programmatic calls).
+        self.validation_mode_button.setChecked(not is_annotation)
+        self.annotation_mode_button.setChecked(is_annotation)
+        self.level_selector_widget.setVisible(is_annotation)
+        # Show-all / hide-all only make sense for multi-visibility validation.
+        self.class_action_widget.setVisible(not is_annotation)
+        # Swap open entries + annotation-only controls.
+        self.open_button.setVisible(not is_annotation)
+        self.open_images_json_button.setVisible(not is_annotation)
+        self.open_images_button.setVisible(is_annotation)
+        self.open_dataset_button.setVisible(is_annotation)
+        self.draw_button.setVisible(is_annotation)
+        self.delete_button.setVisible(is_annotation)
+        self.save_all_button.setVisible(is_annotation)
+        self.canvas.set_select_enabled(is_annotation)
+        if not is_annotation:
+            # Leaving annotation: stop drawing.
+            self.draw_button.setChecked(False)
+            self.canvas.set_draw_shape(None)
+        if is_annotation:
+            self._populate_level_classes()
+        else:
+            self._populate_class_checkboxes()
+        # Show the restored session's current image, or an idle canvas.
+        if self.dataset is not None and self.images:
+            self._load_current_image(reset_fit=True)
+        else:
+            self.canvas.set_idle()
+            self.current_overlay_items = []
+        self._sync_draw_state()
+        self._update_action_buttons()
+        self._update_status_labels()
+
+    def _set_level(self, level: int) -> None:
+        """Choose the active annotation level and show its class list."""
+        if level not in levels.LEVELS:
+            return
+        self.annotation_level = level
+        button = self.level_buttons.get(level)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        if self.mode == "annotation":
+            self.canvas.clear_selection()
+            self._populate_level_classes()
+            self._sync_draw_state()
+            self._refresh_overlay_items()
+            self._update_status_labels()
+
+    def _active_category(self) -> int | None:
+        return self.active_category_by_level.get(self.annotation_level)
+
+    # ----- keyboard-shortcut helpers --------------------------------------
+    def _toggle_mode(self) -> None:
+        self._set_mode("annotation" if self.mode == "validation" else "validation")
+
+    def _shortcut_level(self, level: int) -> None:
+        if self.mode == "annotation":
+            self._set_level(level)
+
+    def _toggle_draw_shortcut(self) -> None:
+        if self.mode == "annotation":
+            self.draw_button.setChecked(not self.draw_button.isChecked())
+
+    def _open_shortcut(self) -> None:
+        if self.mode == "annotation":
+            self._open_images_for_annotation()
+        else:
+            self._open_folder()
+
+    def _populate_level_classes(self) -> None:
+        """Fill the sidebar with the current level's classes (grouped, single-select)."""
+        self._clear_class_checkboxes()
+        active = self._active_category()
+        for header, class_list in levels.level_groups(self.annotation_level):
+            section = self._make_section(header)
+            self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, section)
+            for class_name, default_hex in class_list:
+                category_id = levels.category_id_for_class(self.annotation_level, class_name) or 0
+                color = color_for_class(class_name, category_id, default_hex)
+                bubble = ClassBubbleButton(category_id, class_name, color, self._on_bubble_color_changed, self.class_list_container)
+                bubble.setChecked(category_id == active)
+                bubble.toggled.connect(lambda checked, cid=category_id: self._on_level_class_clicked(cid, checked))
+                self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, bubble)
+                self.class_checkboxes[category_id] = bubble
+
+    def _on_level_class_clicked(self, category_id: int, checked: bool) -> None:
+        """Single-select: one active class per level (click the active one again to clear)."""
+        if checked:
+            self.active_category_by_level[self.annotation_level] = category_id
+            for other_id, bubble in self.class_checkboxes.items():
+                if other_id != category_id and bubble.isChecked():
+                    bubble.blockSignals(True)
+                    bubble.setChecked(False)
+                    bubble.blockSignals(False)
+                    bubble._refresh_style()
+        elif self.active_category_by_level.get(self.annotation_level) == category_id:
+            self.active_category_by_level[self.annotation_level] = None
+        self._sync_draw_state()
+        self._update_status_labels()
+
+    # ----- annotation: open / load / per-level stores ---------------------
+    def _open_images_for_annotation(self) -> None:
+        initial_directory = self.last_opened_directory or str(Path.cwd())
+        folder = QFileDialog.getExistingDirectory(self, "Select images folder to annotate", initial_directory)
+        if not folder:
+            return
+        try:
+            loaded = load_images_only(folder)
+        except Exception as error:
+            self._show_message(f"Could not open images: {error}")
+            return
+        self._save_last_opened_directory(folder)
+        self._apply_images_only(loaded)
+
+    def _apply_images_only(self, loaded: dict) -> None:
+        """Set up an annotation session from an images-only folder (+ resume per-level JSONs)."""
+        self._cleanup_temp_extraction()
+        self._rle_polygon_cache.clear()
+        self._dirty = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        # Truthy sentinel so shared guards (which test ``self.dataset``) pass.
+        self.dataset = {"annotation": True}
+        self.temp_extraction = None
+        self.annotation_root = loaded["root"]
+        self.images_path = loaded["images_path"]
+        self.images = loaded["images"]
+        self.annotation_store = {lvl: {} for lvl in levels.LEVEL_IDS}
+        self.categories_by_id = {}
+        self.class_items = []
+        self.current_category_ids = []
+        self.current_class_items = []
+        self.index = 0
+        self._load_existing_level_files()
+        self._populate_image_selector()
+        self._load_current_image(reset_fit=True)
+        self._update_status_labels()
+        self._update_action_buttons()
+        self._sync_canvas_state()
+        self._sync_draw_state()
+
+    def _level_json_path(self, level: int) -> Path:
+        return Path(self.annotation_root) / f"level{level}.json"
+
+    def _load_existing_level_files(self) -> None:
+        """Resume: read any level{N}.json next to the images into the per-level stores."""
+        for level in levels.LEVEL_IDS:
+            path = self._level_json_path(level)
+            if not path.is_file():
+                continue
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception:
+                continue
+            id_to_name = {
+                image.get("id"): os.path.basename(str(image.get("file_name", "")))
+                for image in data.get("images", [])
+            }
+            store: dict[str, list] = {}
+            for annotation in data.get("annotations", []):
+                if not isinstance(annotation, dict):
+                    continue
+                name = id_to_name.get(annotation.get("image_id")) or os.path.basename(str(annotation.get("file_name", "")))
+                if not name:
+                    continue
+                store.setdefault(name, []).append(annotation)
+            self.annotation_store[level] = store
+
+    def _current_image_basename(self) -> str:
+        return os.path.basename(self.current_image_name) if self.current_image_name else ""
+
+    def _current_level_annotations(self) -> list:
+        """The active level's annotation list for the current image (created on demand)."""
+        basename = self._current_image_basename()
+        if not basename:
+            return []
+        return self.annotation_store[self.annotation_level].setdefault(basename, [])
+
+    def _open_dataset_for_annotation(self) -> None:
+        """Convert an existing COCO dataset folder into the 3 per-level annotation stores."""
+        initial_directory = self.last_opened_directory or str(Path.cwd())
+        folder = QFileDialog.getExistingDirectory(self, "Select a dataset folder to convert for annotation", initial_directory)
+        if not folder:
+            return
+        try:
+            images_path, annotations_path = find_coco_paths(folder)
+            images, _images_by_id, annotations_by_image_id, categories_by_id = load_coco_data(annotations_path, images_path)
+        except Exception as error:
+            self._show_message(f"Could not load dataset: {error}")
+            return
+        self._save_last_opened_directory(folder)
+        self._apply_converted_dataset(folder, images_path, images, annotations_by_image_id, categories_by_id)
+
+    @staticmethod
+    def _convert_source_annotation(annotation: dict, level: int, class_name: str) -> dict | None:
+        """Map one source COCO annotation into our per-level annotation shape."""
+        category_id = levels.category_id_for_class(level, class_name)
+        if category_id is None:
+            return None
+        out: dict = {"category_id": category_id, "iscrowd": annotation.get("iscrowd", 0)}
+        segmentation = annotation.get("segmentation")
+        bbox = annotation.get("bbox")
+        if isinstance(segmentation, list) and segmentation and isinstance(segmentation[0], list) and len(segmentation[0]) >= 6:
+            contour = segmentation[0]
+            out["segmentation"] = [list(contour)]
+            points = [(contour[i], contour[i + 1]) for i in range(0, len(contour) - 1, 2)]
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            out["bbox"] = list(bbox[:4]) if (bbox and len(bbox) >= 4) else [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+            out["area"] = annotation.get("area") or polygon_area(points)
+            out["rotation"] = float(annotation.get("rotation", 0) or 0)
+            return out
+        if bbox and len(bbox) >= 4:
+            x, y, width, height = (float(v) for v in bbox[:4])
+            out["bbox"] = [x, y, width, height]
+            out["area"] = annotation.get("area") or (width * height)
+            out["rotation"] = float(annotation.get("rotation", 0) or 0)
+            out["segmentation"] = [[x, y, x + width, y, x + width, y + height, x, y + height]]
+            return out
+        return None  # RLE-only / geometry-less annotations are skipped
+
+    def _apply_converted_dataset(self, root: str, images_path: str, images: list, annotations_by_image_id: dict, categories_by_id: dict) -> None:
+        self._cleanup_temp_extraction()
+        self._rle_polygon_cache.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.dataset = {"annotation": True}
+        self.temp_extraction = None
+        self.annotation_root = os.path.abspath(root)
+        self.images_path = images_path
+        self.images = sorted(images, key=lambda image_data: image_data.get("id", 0))
+        self.categories_by_id = {}
+        self.class_items = []
+        self.current_category_ids = []
+        self.current_class_items = []
+        self.index = 0
+        self.annotation_store = {lvl: {} for lvl in levels.LEVEL_IDS}
+
+        id_to_name = {image.get("id"): os.path.basename(str(image.get("file_name", ""))) for image in images}
+        converted = 0
+        dropped = 0
+        for image_id, annotations in annotations_by_image_id.items():
+            basename = id_to_name.get(image_id)
+            if not basename:
+                continue
+            for annotation in annotations:
+                class_name = categories_by_id.get(annotation.get("category_id"))
+                level = levels.level_for_class(str(class_name)) if class_name is not None else None
+                if level is None:
+                    dropped += 1
+                    continue
+                new_annotation = self._convert_source_annotation(annotation, level, str(class_name))
+                if new_annotation is None:
+                    dropped += 1
+                    continue
+                self.annotation_store[level].setdefault(basename, []).append(new_annotation)
+                converted += 1
+
+        self._dirty = converted > 0
+        self._populate_image_selector()
+        self._load_current_image(reset_fit=True)
+        self._update_status_labels()
+        self._update_action_buttons()
+        self._sync_canvas_state()
+        self._sync_draw_state()
+        message = f"Converted {converted} annotation(s) into the 3 levels."
+        if dropped:
+            message += f"\n{dropped} skipped (class not in any level, or RLE-only)."
+        message += "\nSave / Save all to write the level JSON files."
+        self._show_message(message)
 
     def _populate_image_selector(self) -> None:
         """Fill the image selector combo box with all available images."""
@@ -2039,6 +2834,9 @@ class PyQtAnnotationReview(QMainWindow):
 
     def _next_image(self) -> None:
         if not self.images:
+            return
+        # Annotation sessions never auto-close; just stop at the last image.
+        if self.mode == "annotation" and self.index >= len(self.images) - 1:
             return
         self.index += 1
         if self.index >= len(self.images):
@@ -2180,7 +2978,51 @@ class PyQtAnnotationReview(QMainWindow):
 
         return overlay_items
 
+    def _build_annotation_overlay_items(self, annotations, level: int) -> list[dict]:
+        """Overlays for the active annotation level (other levels are hidden)."""
+        geometry = levels.level_geometry(level)
+        class_colors = levels.level_class_colors(level)
+        overlay_items: list[dict] = []
+        for annotation in annotations:
+            category_id = annotation.get("category_id")
+            class_name = levels.class_name_for_category(level, category_id) if category_id is not None else None
+            label = str(class_name) if class_name else str(category_id)
+            color = color_for_class(str(class_name), int(category_id) if category_id is not None else 0, class_colors.get(str(class_name)))
+            color_rgb = (color.red(), color.green(), color.blue())
+
+            rotation = float(annotation.get("rotation", 0) or 0)
+            if geometry == levels.GEOMETRY_ROTATED_BBOX and rotation == 0:
+                bbox = annotation.get("bbox") or []
+                if len(bbox) < 4:
+                    continue
+                x, y, width, height = (float(v) for v in bbox[:4])
+                points = [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+                overlay_items.append({
+                    "shape": "bbox", "points": points, "center": (x + width / 2.0, y + height / 2.0),
+                    "label": label, "color": color_rgb, "annotation": annotation, "editable": True,
+                })
+                continue
+
+            segmentation = annotation.get("segmentation")
+            if not (isinstance(segmentation, list) and segmentation and isinstance(segmentation[0], list) and len(segmentation[0]) >= 6):
+                continue
+            segment = segmentation[0]
+            points = [(float(segment[i]), float(segment[i + 1])) for i in range(0, len(segment) - 1, 2)]
+            overlay_items.append({
+                "shape": "polygon", "points": points, "center": polygon_centroid(points),
+                "label": label, "color": color_rgb, "annotation": annotation, "seg_index": 0, "editable": True,
+            })
+        return overlay_items
+
     def _refresh_overlay_items(self) -> None:
+        if self.mode == "annotation":
+            annotations = self._current_level_annotations()
+            self.current_annotations = annotations
+            self.current_overlay_items = self._build_annotation_overlay_items(annotations, self.annotation_level)
+            self.canvas.set_overlay_items(self.current_overlay_items)
+            self.canvas.update()
+            self._update_status_labels()
+            return
         if not self.dataset:
             return
         self.current_overlay_items = self._build_overlay_items(self.current_annotations)
@@ -2198,12 +3040,123 @@ class PyQtAnnotationReview(QMainWindow):
         self._update_action_buttons()
         self._update_status_labels()
 
+    def _make_annotation(self, level: int, category_id: int, payload: dict) -> dict | None:
+        """Build an annotation dict for the active level from a drawn-shape payload."""
+        shape = payload.get("shape")
+        points = [(float(x), float(y)) for x, y in payload.get("points", [])]
+        if shape == "bbox":
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            x, y = min(xs), min(ys)
+            width, height = max(xs) - x, max(ys) - y
+            if width < 1 or height < 1:
+                return None
+            quad = [x, y, x + width, y, x + width, y + height, x, y + height]
+            return {
+                "category_id": category_id,
+                "bbox": [x, y, width, height],
+                "area": width * height,
+                "segmentation": [quad],
+                "rotation": 0,
+                "iscrowd": 0,
+            }
+        if shape == "obbox":
+            if len(points) < 4:
+                return None
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            x, y = min(xs), min(ys)
+            width, height = max(xs) - x, max(ys) - y
+            if width < 1 and height < 1:
+                return None
+            return {
+                "category_id": category_id,
+                "segmentation": [[coord for point in points for coord in point]],
+                "bbox": [x, y, width, height],
+                "area": polygon_area(points),
+                "rotation": float(payload.get("rotation", 0) or 0),
+                "iscrowd": 0,
+            }
+        # polygon
+        if len(points) < 3:
+            return None
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x, y = min(xs), min(ys)
+        width, height = max(xs) - x, max(ys) - y
+        return {
+            "category_id": category_id,
+            "segmentation": [[coord for point in points for coord in point]],
+            "bbox": [x, y, width, height],
+            "area": polygon_area(points),
+            "iscrowd": 0,
+        }
+
+    def _on_annotation_created(self, payload: dict) -> None:
+        """Canvas finished a new shape: attach the active class and store it (undoable)."""
+        if self.mode != "annotation":
+            return
+        active = self._active_category()
+        if active is None:
+            return
+        annotation = self._make_annotation(self.annotation_level, active, payload)
+        if annotation is None:
+            return
+        annotations = self._current_level_annotations()
+        annotations.append(annotation)
+        record = {
+            "kind": "create",
+            "level": self.annotation_level,
+            "basename": self._current_image_basename(),
+            "annotation": annotation,
+            "image_index": self.index,
+        }
+        self._undo_stack.append(record)
+        self._redo_stack.clear()
+        self._dirty = True
+        self._refresh_overlay_items()
+        self._update_action_buttons()
+        self._update_status_labels()
+
+    def _on_selection_changed(self) -> None:
+        self.delete_button.setEnabled(self.mode == "annotation" and self.canvas.selected_annotation() is not None)
+
+    def _delete_selected_annotation(self) -> bool:
+        """Remove the selected annotation from the active level's store (undoable)."""
+        if self.mode != "annotation":
+            return False
+        annotation = self.canvas.selected_annotation()
+        if annotation is None:
+            return False
+        annotations = self._current_level_annotations()
+        if not any(item is annotation for item in annotations):
+            return False
+        annotations[:] = [item for item in annotations if item is not annotation]
+        record = {
+            "kind": "delete",
+            "level": self.annotation_level,
+            "basename": self._current_image_basename(),
+            "annotation": annotation,
+            "image_index": self.index,
+        }
+        self._undo_stack.append(record)
+        self._redo_stack.clear()
+        self._dirty = True
+        self.canvas.clear_selection()
+        self._refresh_overlay_items()
+        self._update_action_buttons()
+        self._update_status_labels()
+        return True
+
     def _update_action_buttons(self) -> None:
         self.undo_button.setEnabled(bool(self._undo_stack))
         self.redo_button.setEnabled(bool(self._redo_stack))
         has_dataset = self.dataset is not None
+        is_annotation = self.mode == "annotation"
         self.save_button.setEnabled(has_dataset)
-        self.save_button.setText("● Save" if (has_dataset and self._dirty) else "Save")
+        self.save_all_button.setEnabled(has_dataset and is_annotation)
+        save_label = "● Save level" if (has_dataset and self._dirty) else ("Save level" if is_annotation else "Save")
+        self.save_button.setText(save_label)
 
     def _restore_snapshot(self, record: dict, key: str) -> None:
         """Apply the 'before'/'after' geometry snapshot of a record and show its image."""
@@ -2220,12 +3173,33 @@ class PyQtAnnotationReview(QMainWindow):
         else:
             self._refresh_overlay_items()
 
+    def _apply_record(self, record: dict, undo: bool) -> None:
+        """Apply one undo/redo record: geometry snapshot, or add/remove an annotation."""
+        kind = record.get("kind", "edit")
+        if kind not in ("create", "delete"):
+            self._restore_snapshot(record, "before" if undo else "after")
+            return
+
+        target_index = record.get("image_index", self.index)
+        if self.images and 0 <= target_index < len(self.images) and target_index != self.index:
+            self.index = target_index
+            self._load_current_image(reset_fit=True)
+        annotations = self.annotation_store[record["level"]].setdefault(record["basename"], [])
+        annotation = record["annotation"]
+        should_have = (undo and kind == "delete") or (not undo and kind == "create")
+        present = any(item is annotation for item in annotations)
+        if should_have and not present:
+            annotations.append(annotation)
+        elif not should_have and present:
+            annotations[:] = [item for item in annotations if item is not annotation]
+        self._refresh_overlay_items()
+
     def _undo(self) -> None:
         if not self._undo_stack:
             return
         record = self._undo_stack.pop()
         self._redo_stack.append(record)
-        self._restore_snapshot(record, "before")
+        self._apply_record(record, undo=True)
         self._dirty = bool(self._undo_stack)
         self._update_action_buttons()
         self._update_status_labels()
@@ -2235,14 +3209,108 @@ class PyQtAnnotationReview(QMainWindow):
             return
         record = self._redo_stack.pop()
         self._undo_stack.append(record)
-        self._restore_snapshot(record, "after")
+        self._apply_record(record, undo=False)
         self._dirty = bool(self._undo_stack)
         self._update_action_buttons()
         self._update_status_labels()
 
+    @staticmethod
+    def _read_image_size(path: str) -> tuple[int | None, int | None]:
+        reader = QImageReader(path)
+        size = reader.size()
+        if size.isValid():
+            return size.width(), size.height()
+        return None, None
+
+    def _finalize_annotation_for_save(self, annotation: dict, level: int) -> dict:
+        """Copy + normalize an annotation for COCO output (ensure box segmentation/area)."""
+        out = copy.deepcopy(annotation)
+        if levels.level_geometry(level) == levels.GEOMETRY_ROTATED_BBOX:
+            bbox = out.get("bbox") or []
+            rotation = float(out.get("rotation", 0) or 0)
+            segmentation = out.get("segmentation")
+            has_quad = isinstance(segmentation, list) and segmentation and isinstance(segmentation[0], list) and len(segmentation[0]) >= 8
+            if len(bbox) >= 4 and (rotation == 0 or not has_quad):
+                x, y, width, height = (float(v) for v in bbox[:4])
+                out["segmentation"] = [[x, y, x + width, y, x + width, y + height, x, y + height]]
+                if rotation == 0:
+                    out["area"] = width * height
+        out.setdefault("iscrowd", 0)
+        return out
+
+    def _build_level_coco(self, level: int) -> dict:
+        """Assemble a COCO dict for one level from its in-memory store."""
+        store = self.annotation_store[level]
+        images_out: list[dict] = []
+        annotations_out: list[dict] = []
+        annotation_id = 1
+        for image_info in self.images:
+            file_name = image_info.get("file_name", "")
+            basename = os.path.basename(str(file_name))
+            width = image_info.get("width")
+            height = image_info.get("height")
+            if not width or not height:
+                width, height = self._read_image_size(resolve_image_path(self.images_path, file_name))
+                if width and height:
+                    image_info["width"], image_info["height"] = width, height
+            image_id = image_info.get("id")
+            images_out.append({"id": image_id, "file_name": file_name, "width": width, "height": height})
+            for annotation in store.get(basename, []):
+                out = self._finalize_annotation_for_save(annotation, level)
+                out["id"] = annotation_id
+                out["image_id"] = image_id
+                annotations_out.append(out)
+                annotation_id += 1
+        return {
+            "images": images_out,
+            "categories": levels.level_categories(level),
+            "annotations": annotations_out,
+            "level": level,
+        }
+
+    def _write_level_file(self, level: int) -> tuple[bool, int, str]:
+        """Write level{N}.json next to the images. Returns (ok, annotation_count, name)."""
+        coco = self._build_level_coco(level)
+        path = self._level_json_path(level)
+        try:
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(coco, handle, ensure_ascii=False)
+        except OSError as error:
+            self._show_message(f"Could not save {path.name}: {error}")
+            return False, 0, path.name
+        return True, len(coco["annotations"]), path.name
+
+    def _save_all_levels(self) -> None:
+        if not self.dataset or self.mode != "annotation" or not self.annotation_root:
+            return
+        total = 0
+        names: list[str] = []
+        for level in levels.LEVEL_IDS:
+            ok, count, name = self._write_level_file(level)
+            if not ok:
+                return
+            total += count
+            names.append(name)
+        self._dirty = False
+        self._update_action_buttons()
+        self._update_status_labels()
+        self._show_message(f"Saved {total} annotations to:\n{', '.join(names)}")
+
     def _save_dataset(self) -> None:
-        """Write the current (edited) annotations to a COCO JSON file."""
+        """Write the current annotations to disk (per-level JSON in annotation mode)."""
         if not self.dataset:
+            return
+
+        if self.mode == "annotation":
+            if not self.annotation_root:
+                return
+            ok, count, name = self._write_level_file(self.annotation_level)
+            if not ok:
+                return
+            self._dirty = False
+            self._update_action_buttons()
+            self._update_status_labels()
+            self._show_message(f"Saved {count} annotations to {name}")
             return
 
         initial_directory = self.last_opened_directory or self.images_path or str(Path.cwd())
@@ -2287,9 +3355,49 @@ class PyQtAnnotationReview(QMainWindow):
         noun = "image" if count == 1 else "images"
         return f"Could not read {count} {noun}."
 
+    def _load_current_image_annotation(self, reset_fit: bool) -> None:
+        """Load the current image for an annotation session (per-level overlays)."""
+        failed_count = 0
+        while True:
+            if self.index >= len(self.images):
+                # Annotation sessions never auto-close; clamp to the last image.
+                self.index = max(0, len(self.images) - 1)
+                if failed_count:
+                    self._show_message(self._unreadable_message(failed_count))
+                return
+            image_info = self.images[self.index]
+            image_name = str(image_info.get("file_name", ""))
+            image_path = resolve_image_path(self.images_path, image_name)
+            if self.canvas.load_image(image_path, ""):
+                self.current_image_name = image_name
+                self.current_image_path = image_path
+                width, height = self.canvas._base_image_size()
+                if width and height:
+                    image_info["width"] = width
+                    image_info["height"] = height
+                break
+            failed_count += 1
+            self.index += 1
+
+        self.canvas.cancel_drawing()
+        self.canvas.clear_selection()
+        title = f"{self.index + 1}/{len(self.images)} - {os.path.basename(self.current_image_name)}"
+        self.setWindowTitle(title)
+        self._sync_canvas_state()
+        self._refresh_overlay_items()
+        if reset_fit:
+            self.canvas.fit_to_view()
+        self._update_status_labels()
+        if failed_count:
+            self._show_message(self._unreadable_message(failed_count))
+
     def _load_current_image(self, reset_fit: bool) -> None:
         if not self.dataset or not self.images:
             self.canvas.set_idle()
+            return
+
+        if self.mode == "annotation":
+            self._load_current_image_annotation(reset_fit)
             return
 
         # Advance past any images that cannot be read, counting them so we can
@@ -2353,6 +3461,22 @@ class PyQtAnnotationReview(QMainWindow):
             self._show_message(self._unreadable_message(failed_count))
 
     def _update_status_labels(self) -> None:
+        if self.mode == "annotation":
+            active = self._active_category()
+            active_name = levels.class_name_for_category(self.annotation_level, active) if active is not None else None
+            parts = [
+                "Annotate",
+                f"Level {self.annotation_level} · {levels.level_title(self.annotation_level)}",
+            ]
+            if self.images:
+                parts.insert(1, f"{self.index + 1}/{len(self.images)}")
+            parts.append(f"class: {active_name}" if active_name else "class: none")
+            text = "   ·   ".join(parts)
+            if self._dirty:
+                text += "   ·   ● unsaved edits"
+            self.status_label.setText(text)
+            self.copy_id_button.setEnabled(bool(self.images))
+            return
         if not self.dataset:
             self.status_label.setText("No dataset loaded — open a zip/folder or images + JSON to begin")
             self.copy_id_button.setEnabled(False)
@@ -2380,6 +3504,29 @@ class PyQtAnnotationReview(QMainWindow):
         self.status_label.setText(text)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        # While drawing, Enter finishes a polygon, Esc cancels, Backspace drops a vertex.
+        # These must beat the global shortcuts (Enter=next image, Esc=quit).
+        if self.mode == "annotation" and self.canvas.has_pending_drawing():
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.canvas.finish_polygon()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Escape:
+                self.canvas.cancel_drawing()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Backspace:
+                self.canvas.remove_last_point()
+                event.accept()
+                return
+
+        # Delete/Backspace removes the selected annotation (when not mid-drawing).
+        if self.mode == "annotation" and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self._delete_selected_annotation():
+                event.accept()
+                return
+
         seq = QKeySequence(event.keyCombination()).toString()
         action_id = self._shortcut_index.get(seq)
         if action_id is not None:
@@ -2390,6 +3537,13 @@ class PyQtAnnotationReview(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._cleanup_temp_extraction()
+        for snapshot in self._sessions.values():
+            stashed = snapshot.get("temp_extraction")
+            if stashed is not None:
+                try:
+                    stashed.cleanup()
+                except Exception:
+                    pass
         super().closeEvent(event)
 
 
@@ -2408,8 +3562,15 @@ def main() -> None:
     app.setApplicationName("Annotation Workbench")
     app.setStyle("Fusion")
 
+    from PyQt6.QtCore import QTimer
+
     window = PyQtAnnotationReview(args.input_path)
+    # Remember a sensible restore (un-maximized) size, then show normally and
+    # maximize on the next event-loop tick. Calling showMaximized() before the
+    # window is realized leaves it flagged maximized but sized to the resize()
+    # on some Windows/DPI setups; deferring it makes the maximize actually take.
     window.resize(int(round(MONITOR_WIDTH * 0.9)), int(round(MONITOR_HEIGHT * 0.87)))
-    window.showMaximized()
+    window.show()
+    QTimer.singleShot(0, window.showMaximized)
 
     sys.exit(app.exec())

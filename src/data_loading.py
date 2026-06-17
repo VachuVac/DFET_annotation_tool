@@ -376,6 +376,63 @@ def load_dataset_from_folder_and_json(images_path: str, annotations_path: str):
     return _assemble_dataset(os.path.abspath(images_path), os.path.abspath(annotations_path), None)
 
 
+def _dir_has_images(directory: Path) -> bool:
+    try:
+        return any(
+            entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS
+            for entry in os.scandir(directory)
+        )
+    except OSError:
+        return False
+
+
+def list_images_in_dir(images_dir: str) -> list[str]:
+    """Sorted image file basenames directly inside ``images_dir``."""
+    return sorted(
+        entry.name
+        for entry in os.scandir(images_dir)
+        if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
+def discover_images_dir(folder: str) -> str:
+    """Find the directory that actually holds the images for an annotation session.
+
+    Prefers ``<folder>/images``, then ``folder`` itself, then the shallowest
+    nested directory that contains image files.
+    """
+    folder_path = Path(folder)
+    images_subdir = folder_path / "images"
+    if images_subdir.is_dir() and _dir_has_images(images_subdir):
+        return str(images_subdir)
+    if _dir_has_images(folder_path):
+        return str(folder_path)
+    for candidate in sorted((p for p in folder_path.rglob("*") if p.is_dir()), key=lambda p: len(p.parts)):
+        if _dir_has_images(candidate):
+            return str(candidate)
+    return str(folder_path)
+
+
+def load_images_only(folder: str) -> dict:
+    """Build an images-only session (no annotations) from a plain folder.
+
+    ``root`` is the folder the user picked (where per-level COCO JSONs live);
+    ``images_path`` is the resolved directory the image files sit in.
+    """
+    if not folder or not os.path.isdir(folder):
+        raise ValueError("Selected folder is not a valid directory.")
+    images_dir = discover_images_dir(folder)
+    names = list_images_in_dir(images_dir)
+    if not names:
+        raise FileNotFoundError("No image files found in the selected folder.")
+    images = [{"id": stable_image_id(name), "file_name": name} for name in names]
+    return {
+        "root": os.path.abspath(folder),
+        "images_path": os.path.abspath(images_dir),
+        "images": images,
+    }
+
+
 def resolve_image_path(images_path: str, coco_file_name: str) -> str:
     """Resolve full path to an image file."""
     normalized_file_name = coco_file_name.replace("\\", "/")
