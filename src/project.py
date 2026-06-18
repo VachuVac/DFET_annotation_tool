@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -150,6 +151,7 @@ class Project:
         # Make sure the expected subfolders exist even if hand-edited.
         project.images_dir.mkdir(parents=True, exist_ok=True)
         project.annotations_dir.mkdir(parents=True, exist_ok=True)
+        project._ensure_unmapped_ids()  # backfill ids onto older stashes
         return project
 
     # ------------------------------------------------------------------ #
@@ -387,6 +389,34 @@ class Project:
         return counts
 
     # ------------------------------------------------------------------ #
+    # export
+    # ------------------------------------------------------------------ #
+    def export_zip(self, dest_path: str) -> Path:
+        """Bundle the whole project into a single shareable ``.zip``.
+
+        The archive holds the manifest, ``images/`` and the level JSONs under a
+        top-level ``<ProjectName>/`` directory, so unzipping yields a folder that
+        :meth:`open` accepts directly. Returns the written path (``.zip`` enforced).
+        """
+        import zipfile
+
+        dest = Path(dest_path)
+        if dest.suffix.lower() != ".zip":
+            dest = dest.with_suffix(".zip")
+        self.save_manifest()  # make sure project.json reflects the live registry
+        try:
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as archive:
+                for path in sorted(self.root.rglob("*")):
+                    # Skip the archive itself if the user wrote it inside the project.
+                    if path.is_file() and path.resolve() != dest.resolve():
+                        # as_posix(): zip entries use '/', not the OS separator.
+                        arcname = (Path(self.root.name) / path.relative_to(self.root)).as_posix()
+                        archive.write(path, arcname)
+        except OSError as error:
+            raise ProjectError(f"Could not export zip: {error}") from error
+        return dest
+
+    # ------------------------------------------------------------------ #
     # stash (orphan annotations) + promotion
     # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
@@ -417,6 +447,7 @@ class Project:
         for entry in entries:
             unmapped.append(
                 {
+                    "id": uuid.uuid4().hex,  # stable per-object handle (for per-object resolve)
                     "raw_class": str(entry["raw_class"]),
                     "stable_image_id": int(entry["stable_image_id"]),
                     "file_name": os.path.basename(str(entry.get("file_name", ""))),
@@ -425,6 +456,38 @@ class Project:
             )
         self.write_unmapped(unmapped)
         return len(unmapped)
+
+    def _ensure_unmapped_ids(self) -> None:
+        """Backfill stable ``id``s onto any pre-existing stash entries lacking one."""
+        unmapped = self.read_unmapped()
+        changed = False
+        for entry in unmapped:
+            if not entry.get("id"):
+                entry["id"] = uuid.uuid4().hex
+                changed = True
+        if changed:
+            self.write_unmapped(unmapped)
+
+    def get_unmapped_entry(self, entry_id: str) -> dict | None:
+        """Return the stashed entry with this id, or None."""
+        for entry in self.read_unmapped():
+            if entry.get("id") == entry_id:
+                return entry
+        return None
+
+    def pop_unmapped_entry(self, entry_id: str) -> dict | None:
+        """Remove + return the stashed entry with this id (persisted), or None."""
+        unmapped = self.read_unmapped()
+        kept: list[dict] = []
+        popped: dict | None = None
+        for entry in unmapped:
+            if popped is None and entry.get("id") == entry_id:
+                popped = entry
+            else:
+                kept.append(entry)
+        if popped is not None:
+            self.write_unmapped(kept)
+        return popped
 
     def unmapped_class_counts(self) -> dict[str, int]:
         """Distinct unknown class names still awaiting redefinition -> count."""
@@ -466,6 +529,20 @@ class Project:
             entry
             for entry in self.read_unmapped()
             if entry.get("assigned_level") is not None and int(entry["assigned_level"]) == int(level)
+        ]
+
+    def unmapped_entries_visible_on_level(self, level: int) -> list[dict]:
+        """Stashed entries to highlight on ``level``.
+
+        An entry parked in a specific level (``assigned_level`` set) shows only
+        there. An entry not yet parked anywhere (``assigned_level`` None/absent)
+        shows on EVERY level, so a reviewer sees it regardless of which level they
+        are on until it is assigned to the right one.
+        """
+        return [
+            entry
+            for entry in self.read_unmapped()
+            if entry.get("assigned_level") is None or int(entry["assigned_level"]) == int(level)
         ]
 
     def read_pending(self) -> list[dict]:

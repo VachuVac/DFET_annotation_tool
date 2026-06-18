@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PyQt6.QtWidgets import QApplication
 
+from src import levels
 from src.project import Project
 from src.qt_main import PyQtAnnotationReview
 
@@ -71,6 +72,22 @@ def test_activate_project_switches_to_main_view() -> None:
         assert window.images == []
         assert window.annotation_root == str(project.annotations_dir)
         assert window.images_path == str(project.images_dir)
+
+
+def test_level_selector_visible_after_project_activation() -> None:
+    # Opening a project (mode still defaults to validation) must reveal the
+    # L1/L2/L3 selector right away -- without first toggling the mode buttons.
+    window = _window()
+    assert window.mode == "validation"
+    assert window.level_selector_widget.isHidden() is True  # no project yet
+    with tempfile.TemporaryDirectory() as parent:
+        project = Project.create(parent, "Levels", image_size=STUB_SIZE)
+        window._activate_project(project)
+        assert window.level_selector_widget.isHidden() is False  # now revealed
+        # Closing the project hides it again (back to bare validation chrome).
+        window._confirm_discard_unsaved = lambda *a, **k: True  # type: ignore[assignment]
+        window._close_project()
+        assert window.level_selector_widget.isHidden() is True
 
 
 def test_import_images_into_open_project() -> None:
@@ -192,6 +209,56 @@ def test_route_orphan_annotation_is_stashed() -> None:
 
         assert len(project.read_pending()) == 1
         assert project.read_level(1).get(ghost) is None
+
+
+def test_route_matches_present_image_by_stable_id_not_filename() -> None:
+    # The same photo re-exported under a different prefix shares a stable_image_id
+    # but NOT a filename. Routing must recognise it as already present (by id) and
+    # land the annotation on the registry's image -- never stash it as an orphan.
+    from src.data_loading import stable_image_id
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        registered = "aaaaaaaa-4DDN-BNFL.png"  # what the project already holds
+        reexported = "bbbbbbbb-4DDN-BNFL.png"  # same trailing photo-id, new prefix
+        assert stable_image_id(registered) == stable_image_id(reexported)
+        project, _ = _project_with_image(window, parent, src, basename=registered)
+
+        images = [{"id": 5, "file_name": reexported}]
+        annotations = {5: [{"category_id": 200, "bbox": [1, 1, 4, 4], "area": 16}]}
+        window._route_and_commit_annotations(images, annotations, {200: "high_vegetation"})
+
+        # Lands on the registry's image, nothing stashed.
+        assert len(project.read_level(2).get(registered, [])) == 1
+        assert project.read_pending() == []
+
+
+def test_open_project_rescues_stuck_orphans() -> None:
+    # Residue of the old routing bug: an orphan stashed for an image that IS in the
+    # project (matching stable_image_id). Opening the project promotes it.
+    from src.data_loading import stable_image_id
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        present = "cccccccc-7ZZ-QPQR.png"
+        _make_image(Path(src), present)
+        project = Project.create(parent, "Rescue", image_size=STUB_SIZE)
+        project.import_images(src)
+        project.stash_annotations(
+            [
+                {
+                    "level": 2,
+                    "stable_image_id": stable_image_id(present),
+                    "file_name": "dddddddd-7ZZ-QPQR.png",  # different prefix, same id
+                    "annotation": {"category_id": 1, "bbox": [0, 0, 3, 3], "area": 9},
+                }
+            ]
+        )
+        assert len(project.read_pending()) == 1
+
+        window._activate_project(project)  # promote_pending runs on open
+        assert project.read_pending() == []
+        assert len(project.read_level(2).get(present, [])) == 1
 
 
 def _conflict_setup(window, parent, src):
@@ -384,6 +451,46 @@ def test_level_only_park_renders_highlighted_overlay() -> None:
         assert window._pending_redefine_overlays(1) == []
 
 
+def test_unassigned_redefine_shows_on_every_level() -> None:
+    # Until it is parked in a level, a redefinable object must be visible on ALL
+    # levels; once parked, it shows only in that level.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _project_with_image(window, parent, src)
+        images = [{"id": 1, "file_name": basename}]
+        annotations = {1: [{"category_id": 5, "segmentation": [[0, 0, 6, 0, 6, 6, 0, 6]], "bbox": [0, 0, 6, 6], "area": 36}]}
+        window._route_and_commit_annotations(images, annotations, {5: "truck_undamaged"})
+        window._set_mode("annotation")
+
+        # Not parked anywhere yet -> visible on every level.
+        for lvl in (1, 2, 3):
+            assert len(window._pending_redefine_overlays(lvl)) == 1, lvl
+
+        # Park it in level 3 -> now only level 3 shows it.
+        project.set_unmapped_level("truck_undamaged", 3)
+        assert len(window._pending_redefine_overlays(3)) == 1
+        assert window._pending_redefine_overlays(1) == []
+        assert window._pending_redefine_overlays(2) == []
+
+
+def test_image_selector_items_are_numbered() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _make_image(Path(src), "scene_000000001.png")
+        _make_image(Path(src), "scene_000000002.png")
+        project = Project.create(parent, "Nums", image_size=STUB_SIZE)
+        window._activate_project(project)
+        project.import_images(src)
+        window._apply_project_session(reset_index=False)
+
+        texts = [window.image_selector.itemText(i) for i in range(window.image_selector.count())]
+        assert len(texts) == 2
+        # Each row carries its "position/total" prefix (matching the status bar).
+        assert texts[0].startswith("1/2") and texts[1].startswith("2/2")
+        joined = " ".join(texts)
+        assert "scene_000000001.png" in joined and "scene_000000002.png" in joined
+
+
 def test_convert_coerces_polygon_to_box_for_box_level() -> None:
     # A polygon remapped to the box level (L2) becomes its axis-aligned envelope.
     converted = PyQtAnnotationReview._convert_source_annotation(
@@ -395,6 +502,216 @@ def test_convert_coerces_polygon_to_box_for_box_level() -> None:
     assert converted["rotation"] == 0.0
     assert converted["bbox"] == [0.0, 0.0, 10.0, 4.0]
     assert len(converted["segmentation"][0]) == 8  # 4-corner quad
+
+
+def _routed_project_window(window, parent, src):
+    """A project with one image carrying an L1 polygon + an L2 box; return (project, basename)."""
+    project, basename = _project_with_image(window, parent, src)
+    images = [{"id": 1, "file_name": basename}]
+    annotations = {
+        1: [
+            {"category_id": 100, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100},
+            {"category_id": 200, "bbox": [1, 1, 4, 4], "area": 16},
+        ]
+    }
+    window._route_and_commit_annotations(images, annotations, {100: "road_asphalt", 200: "high_vegetation"})
+    return project, basename
+
+
+def test_validation_renders_active_level_on_project() -> None:
+    # Stage F: with a project open, validation reviews ONE level at a time and the
+    # L1/L2/L3 selector drives which. (This path rendered nothing before Stage F.)
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _routed_project_window(window, parent, src)
+
+        window._set_mode("validation")
+        assert window.level_selector_widget.isHidden() is False  # selector shown in validation too
+        window._set_level(1)
+        assert [o["label"] for o in window.current_overlay_items] == ["road_asphalt"]
+
+        window._set_level(2)
+        assert [o["label"] for o in window.current_overlay_items] == ["high_vegetation"]
+
+
+def test_validation_lists_only_present_classes_on_project() -> None:
+    # The validation sidebar shows ONLY classes annotated on the current image
+    # within the level (not the whole level catalog).
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _routed_project_window(window, parent, src)  # L1 has exactly one class: road_asphalt
+        window._set_mode("validation")
+        window._set_level(1)
+        names = [name for _cid, name in window.current_class_items]
+        assert names == ["road_asphalt"]  # not all ~20 L1 catalog classes
+        assert set(window.class_checkboxes) == {levels.category_id_for_class(1, "road_asphalt")}
+
+        # Level 2 likewise shows only its present class.
+        window._set_level(2)
+        names = [name for _cid, name in window.current_class_items]
+        assert names == ["high_vegetation"]
+
+
+def test_validation_respects_class_visibility_on_project() -> None:
+    # Stage F: per-class show/hide toggles operate on the active level's data.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _routed_project_window(window, parent, src)
+        window._set_mode("validation")
+        window._set_level(1)
+        cat_id = levels.category_id_for_class(1, "road_asphalt")
+        window._on_class_toggled(cat_id, False)
+        assert window.current_overlay_items == []
+        window._on_class_toggled(cat_id, True)
+        assert [o["label"] for o in window.current_overlay_items] == ["road_asphalt"]
+
+
+def test_validation_saves_active_level_on_project() -> None:
+    # Stage F: an edit in validation saves back to that level's level{N}.json.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _routed_project_window(window, parent, src)
+        window._set_mode("validation")
+        window._set_level(2)
+        anns = window._current_level_annotations()
+        assert len(anns) == 1
+        anns[0]["bbox"] = [2.0, 2.0, 5.0, 5.0]  # mutate the shared level-store dict
+        window._save_dataset()  # _show_message is stubbed; writes level2.json
+        saved = project.read_level(2)
+        assert saved[basename][0]["bbox"] == [2.0, 2.0, 5.0, 5.0]
+        # The untouched level is unchanged.
+        assert len(project.read_level(1).get(basename, [])) == 1
+
+
+def test_validation_delete_selected_annotation_on_project() -> None:
+    # Stage F follow-up: a reviewer can select a whole object and delete it
+    # (Del / red ✕) in validation, undoably, on the active level's store.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _routed_project_window(window, parent, src)
+        window._set_mode("validation")
+        window._set_level(1)
+        assert window.delete_button.isHidden() is False  # red ✕ available in validation
+
+        anns = window._current_level_annotations()
+        assert len(anns) == 1
+        window.canvas._set_selected(anns[0])  # simulate clicking the object body
+        assert window.delete_button.isEnabled() is True
+        assert window._delete_selected_annotation() is True
+        assert window._current_level_annotations() == []
+
+        window._undo()  # delete is undoable
+        assert len(window._current_level_annotations()) == 1
+
+
+def test_validation_shows_pending_redefine_overlays_on_project() -> None:
+    # Stage F absorbs the Stage I note: parked "redefine" classes must show in
+    # the VALIDATION lens too, not only annotation mode.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _project_with_image(window, parent, src)
+        images = [{"id": 1, "file_name": basename}]
+        annotations = {1: [{"category_id": 5, "segmentation": [[0, 0, 6, 0, 6, 6, 0, 6]], "bbox": [0, 0, 6, 6], "area": 36}]}
+        window._route_and_commit_annotations(images, annotations, {5: "banana"})  # off-catalog -> stashed
+        project.set_unmapped_level("banana", 3)
+
+        window._set_mode("validation")
+        window._set_level(3)
+        assert any(o.get("pending_redefine") for o in window.current_overlay_items)
+        assert any("redefine" in o["label"] for o in window.current_overlay_items)
+
+
+def test_per_level_dirty_tracking_on_project() -> None:
+    # Stage G: edits mark only their level dirty; Save level clears just that
+    # level, Save all clears everything.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _routed_project_window(window, parent, src)  # L1 polygon + L2 box
+        window._set_mode("validation")
+        assert window.action_export_zip.isEnabled() is True
+
+        window._set_level(1)
+        window.canvas._set_selected(window._current_level_annotations()[0])
+        window._delete_selected_annotation()
+        assert window._dirty_levels == {1}
+
+        window._set_level(2)
+        window.canvas._set_selected(window._current_level_annotations()[0])
+        window._delete_selected_annotation()
+        assert window._dirty_levels == {1, 2}
+        assert window._dirty is True
+
+        # Save the active level (L2) -> only L2 clears.
+        window._save_dataset()
+        assert window._dirty_levels == {1}
+        assert window._dirty is True
+
+        # Save all -> everything clears.
+        window._save_all_levels()
+        assert window._dirty_levels == set()
+        assert window._dirty is False
+
+
+def test_warn_on_unsaved_save_discard_cancel() -> None:
+    # Stage G: the close/switch guard saves, discards, or cancels per the choice.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _routed_project_window(window, parent, src)
+        window._set_mode("validation")
+        window._set_level(1)
+        window.canvas._set_selected(window._current_level_annotations()[0])
+        window._delete_selected_annotation()
+        assert window._dirty is True
+
+        # Cancel -> do NOT proceed; nothing saved.
+        window._ask_unsaved_resolution = lambda *a, **k: "cancel"  # type: ignore[assignment]
+        assert window._confirm_discard_unsaved("close") is False
+        assert window._dirty is True
+
+        # Discard -> proceed, still dirty in memory (not persisted).
+        window._ask_unsaved_resolution = lambda *a, **k: "discard"  # type: ignore[assignment]
+        assert window._confirm_discard_unsaved("close") is True
+        assert window._dirty is True
+
+        # Save -> proceed, dirty cleared AND the deletion is on disk.
+        window._ask_unsaved_resolution = lambda *a, **k: "save"  # type: ignore[assignment]
+        assert window._confirm_discard_unsaved("close") is True
+        assert window._dirty is False and window._dirty_levels == set()
+        assert project.read_level(1).get(basename, []) == []
+
+
+def test_redefine_object_selectable_and_reclassified_per_object() -> None:
+    # User request: a parked redefine object is selectable like any object, and
+    # assigning a class resolves JUST that object (others of the same class stay).
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _project_with_image(window, parent, src)
+        images = [{"id": 1, "file_name": basename}]
+        ann1 = {"category_id": 9, "segmentation": [[0, 0, 6, 0, 6, 6, 0, 6]], "bbox": [0, 0, 6, 6], "area": 36}
+        ann2 = {"category_id": 9, "segmentation": [[10, 10, 16, 10, 16, 16, 10, 16]], "bbox": [10, 10, 6, 6], "area": 36}
+        window._route_and_commit_annotations(images, {1: [ann1, ann2]}, {9: "banana"})  # off-catalog -> 2 stashed
+        project.set_unmapped_level("banana", 1)  # park both in L1 -> render as redefine overlays
+
+        window._set_mode("annotation")
+        window._set_level(1)
+        redefine_items = [it for it in window.current_overlay_items if it.get("pending_redefine")]
+        assert len(redefine_items) == 2
+        assert all(it.get("redefine_entry_id") for it in redefine_items)
+
+        # Select one (as a click would) -> the sidebar swaps to the assign panel.
+        window.canvas._set_selected_redefine(redefine_items[0])
+        assert window.canvas.selected_redefine() is redefine_items[0]
+        assert window._redefine_panel_active is True
+
+        # Assign it to an existing L1 class -> only THAT object resolves.
+        window._resolve_redefine_object(redefine_items[0].get("redefine_entry_id"), "road_asphalt")
+
+        store = project.read_level(1)
+        committed = [a.get("category_id") for items in store.values() for a in items]
+        assert committed == [levels.category_id_for_class(1, "road_asphalt")]  # exactly one, right class
+        assert project.unmapped_class_counts() == {"banana": 1}  # the other stays parked
+        assert len(window._pending_redefine_overlays(1)) == 1
+        assert window._redefine_panel_active is False  # normal sidebar restored
 
 
 def _run_all() -> int:

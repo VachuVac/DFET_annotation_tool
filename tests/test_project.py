@@ -227,6 +227,56 @@ def test_stash_then_promote_on_image_add() -> None:
         assert store[orphan_name][0]["segmentation"] == annotation["segmentation"]
 
 
+def test_unmapped_entry_ids_and_pop() -> None:
+    with tempfile.TemporaryDirectory() as parent:
+        project = create_project(parent, "Ids", image_size=STUB_SIZE)
+        ann = {"bbox": [0, 0, 4, 4], "segmentation": [[0, 0, 4, 0, 4, 4, 0, 4]], "area": 16}
+        project.stash_unmapped(
+            [
+                {"raw_class": "banana", "stable_image_id": 1, "file_name": "a.png", "source_annotation": ann},
+                {"raw_class": "banana", "stable_image_id": 1, "file_name": "a.png", "source_annotation": ann},
+            ]
+        )
+        ids = [entry["id"] for entry in project.read_unmapped()]
+        assert len(ids) == 2 and all(ids) and ids[0] != ids[1]  # unique per object
+
+        assert project.get_unmapped_entry(ids[0])["raw_class"] == "banana"
+        popped = project.pop_unmapped_entry(ids[0])
+        assert popped["id"] == ids[0]
+        assert [entry["id"] for entry in project.read_unmapped()] == [ids[1]]  # only one removed
+        assert project.pop_unmapped_entry("nope") is None  # unknown id is a no-op
+        assert len(project.read_unmapped()) == 1
+
+
+def test_export_zip_round_trips() -> None:
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as out:
+        _make_image(Path(src), "scene_000000001.png")
+        project = create_project(parent, "Exp", image_size=STUB_SIZE)
+        project.import_images(str(src))
+        project.write_level(1, {"scene_000000001.png": [{"category_id": 1, "bbox": [0, 0, 4, 4], "area": 16}]})
+
+        written = project.export_zip(str(Path(out) / "bundle"))  # no .zip -> enforced
+        assert written.suffix == ".zip" and written.is_file()
+
+        with zipfile.ZipFile(written) as archive:
+            names = archive.namelist()
+        # Everything under a top-level <ProjectName>/ dir, with forward slashes.
+        assert all(name.startswith("Exp/") for name in names), names
+        assert any(name.endswith("project.json") for name in names)
+        assert any(name.endswith("images/scene_000000001.png") for name in names)
+        assert any(name.endswith("annotations/level1.json") for name in names)
+
+        # Unzipping yields a folder Project.open accepts directly.
+        extract = Path(out) / "x"
+        with zipfile.ZipFile(written) as archive:
+            archive.extractall(extract)
+        reopened = open_project(str(extract / "Exp"), image_size=STUB_SIZE)
+        assert len(reopened.registry_images()) == 1
+        assert reopened.read_level(1).get("scene_000000001.png")
+
+
 def _run_all() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0

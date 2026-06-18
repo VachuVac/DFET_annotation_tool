@@ -69,6 +69,7 @@ try:
         QSlider,
         QSpinBox,
         QStackedWidget,
+        QStyledItemDelegate,
         QVBoxLayout,
         QWidget,
     )
@@ -287,6 +288,8 @@ class ImageCanvas(QWidget):
         # Selection (annotation mode): click an annotation body to select; Delete removes it.
         self._select_enabled = False
         self._selected_annotation: dict | None = None
+        # A parked "redefine" overlay can also be selected (to assign it a class).
+        self._selected_redefine: dict | None = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -495,12 +498,25 @@ class ImageCanvas(QWidget):
     def selected_annotation(self) -> dict | None:
         return self._selected_annotation
 
+    def selected_redefine(self) -> dict | None:
+        return self._selected_redefine
+
     def clear_selection(self) -> None:
-        self._set_selected(None)
+        self._set_selected(None)  # also clears any redefine selection
 
     def _set_selected(self, annotation: dict | None) -> None:
-        if annotation is not self._selected_annotation:
-            self._selected_annotation = annotation
+        changed = annotation is not self._selected_annotation or self._selected_redefine is not None
+        self._selected_annotation = annotation
+        self._selected_redefine = None
+        if changed:
+            self.selectionChanged.emit()
+            self.update()
+
+    def _set_selected_redefine(self, item: dict | None) -> None:
+        changed = item is not self._selected_redefine or self._selected_annotation is not None
+        self._selected_redefine = item
+        self._selected_annotation = None
+        if changed:
             self.selectionChanged.emit()
             self.update()
 
@@ -511,6 +527,10 @@ class ImageCanvas(QWidget):
         image_x, image_y, _, _ = self._fit_display_rect()
         target = QPointF(position.x(), position.y())
         for item in reversed(self._overlay_items):
+            # Read-only overlays (e.g. parked redefine ones) have no annotation to
+            # select; skip them so a real annotation behind stays reachable.
+            if item.get("annotation") is None:
+                continue
             points = item.get("points") or []
             if len(points) < 2:
                 continue
@@ -522,6 +542,23 @@ class ImageCanvas(QWidget):
                     return item.get("annotation")
             elif QPolygonF(screen_points).containsPoint(target, Qt.FillRule.OddEvenFill):
                 return item.get("annotation")
+        return None
+
+    def _hit_test_redefine(self, position) -> dict | None:
+        """Return the topmost parked-redefine overlay under the cursor, if any."""
+        if self._pixmap is None:
+            return None
+        image_x, image_y, _, _ = self._fit_display_rect()
+        target = QPointF(position.x(), position.y())
+        for item in reversed(self._overlay_items):
+            if not item.get("pending_redefine"):
+                continue
+            points = item.get("points") or []
+            if len(points) < 2:
+                continue
+            screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in points]
+            if QPolygonF(screen_points).containsPoint(target, Qt.FillRule.OddEvenFill):
+                return item
         return None
 
     def _image_from_screen(self, screen_x: float, screen_y: float, clamp: bool = False) -> tuple[float, float]:
@@ -724,7 +761,10 @@ class ImageCanvas(QWidget):
             points = item["points"]
             screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in points]
 
-            is_selected = self._selected_annotation is not None and item.get("annotation") is self._selected_annotation
+            is_selected = (
+                (self._selected_annotation is not None and item.get("annotation") is self._selected_annotation)
+                or (item.get("pending_redefine") and item is self._selected_redefine)
+            )
             if is_selected:
                 painter.setPen(QPen(QColor(255, 255, 255), max(2.0, 2.4 * DPI_SCALE)))
             elif item.get("pending_redefine"):
@@ -850,11 +890,16 @@ class ImageCanvas(QWidget):
                 self._dragging = False
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 return
-            # Clicking an annotation body selects it; empty space deselects, then pans.
+            # Clicking an annotation body selects it; a parked redefine overlay is
+            # selectable too (to assign it a class); empty space deselects, then pans.
             if self._select_enabled:
                 annotation = self._hit_test_annotation(event.position())
                 if annotation is not None:
                     self._set_selected(annotation)
+                    return
+                redefine = self._hit_test_redefine(event.position())
+                if redefine is not None:
+                    self._set_selected_redefine(redefine)
                     return
                 self._set_selected(None)
             self._dragging = True
@@ -976,6 +1021,66 @@ class ImageCanvas(QWidget):
             self.fit_to_view()
 
 
+class RedefineRowDelegate(QStyledItemDelegate):
+    """Paints a red background behind image-selector rows flagged as needing
+    redefinition. A delegate is used because the view's QSS (``::item`` background)
+    overrides any model BackgroundRole, so colors set on the item don't show."""
+
+    FLAG_ROLE = Qt.ItemDataRole.UserRole + 100
+
+    def paint(self, painter, option, index) -> None:  # noqa: N802
+        if index.data(self.FLAG_ROLE):
+            painter.fillRect(option.rect, QColor(120, 45, 48))
+        super().paint(painter, option, index)
+
+
+class OutlinedTextButton(QPushButton):
+    """A QPushButton whose label is drawn white with a thin black outline.
+
+    The colored pill background, border and hover/pressed states still come from
+    the widget stylesheet (the base ``paintEvent``); only the text is painted by
+    hand on top, so the label stays legible on *any* fill color (dark or light).
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__("", parent)  # blank so the style engine paints no text itself
+        self._label = text
+
+    def setText(self, text: str) -> None:  # noqa: N802 - keep our label, never hand it to the base
+        self._label = text
+        self.update()
+
+    def text(self) -> str:
+        return self._label
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)  # rounded background + border + hover/pressed via QSS
+        if not self._label:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        font = self.font()
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        pad = max(12, int(round(12 * DPI_SCALE)))  # match the QSS "padding: 7px 12px"
+        avail = max(1, self.width() - 2 * pad)
+        text = metrics.elidedText(self._label, Qt.TextElideMode.ElideRight, avail)
+        baseline = (self.height() + metrics.ascent() - metrics.descent()) / 2.0
+        path = QPainterPath()
+        path.addText(float(pad), float(baseline), font, text)
+        outline = QPen(QColor(0, 0, 0, 235), max(2.0, 2.0 * DPI_SCALE))
+        outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(outline)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)  # black halo around each glyph
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawPath(path)  # white glyph fill on top
+        painter.end()
+
+
 class ClassBubbleButton(QWidget):
     """Colored pill button for a single class filter, with an inline color-picker pencil."""
 
@@ -995,7 +1100,7 @@ class ClassBubbleButton(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self._pill = QPushButton(category_name)
+        self._pill = OutlinedTextButton(category_name)
         self._pill.setCheckable(True)
         self._pill.setChecked(True)
         self._pill.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1190,6 +1295,20 @@ class ShortcutsDialog(QDialog):
         self.setMinimumWidth(max(420, int(round(440 * DPI_SCALE))))
         self._build_ui()
         self._apply_styles()
+        self._fit_to_screen()
+
+    def _fit_to_screen(self) -> None:
+        """Open at a comfortable height that never exceeds the screen work area.
+
+        Without this the all-rows layout asks for a window taller than the
+        display; Windows clamps it and logs a ``setGeometry`` warning. The scroll
+        area absorbs any overflow, so capping the height is purely cosmetic-safe.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        avail_h = screen.availableGeometry().height() if screen is not None else 900
+        target_h = min(max(400, avail_h - 80), int(round(820 * DPI_SCALE)))
+        self.resize(self.sizeHint().width(), target_h)
+        self.setMaximumHeight(avail_h)
 
     # ----- layout ---------------------------------------------------------
     def _build_ui(self) -> None:
@@ -1218,21 +1337,38 @@ class ShortcutsDialog(QDialog):
         self.banner.setVisible(False)
         layout.addWidget(self.banner)
 
+        # The shortcut list can be taller than the screen (many rows + high-DPI),
+        # which made the dialog request an oversized window that Windows clamps
+        # (the QWindowsWindow::setGeometry warning). A scroll area keeps the list
+        # within the work area and scrolls instead; header + buttons stay fixed.
+        scroll = QScrollArea()
+        scroll.setObjectName("shortcutsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("shortcutsContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 6, 0)  # room so the scrollbar doesn't overlap rows
+        content_layout.setSpacing(12)
+
         # Mouse section (fixed / descriptive)
-        layout.addWidget(self._section_label("Mouse"))
+        content_layout.addWidget(self._section_label("Mouse"))
         for desc, action in (
             ("Wheel", "zoom"),
             ("Drag empty space", "pan"),
             ("Drag a handle", "move a box corner / polygon vertex"),
         ):
-            layout.addLayout(self._fixed_row(desc, action))
+            content_layout.addLayout(self._fixed_row(desc, action))
 
         # Keyboard section (editable)
-        layout.addWidget(self._section_label("Keyboard"))
+        content_layout.addWidget(self._section_label("Keyboard"))
         for action_id in self._owner.shortcut_order():
-            layout.addLayout(self._editable_row(action_id))
+            content_layout.addLayout(self._editable_row(action_id))
 
-        layout.addStretch()
+        content_layout.addStretch()
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
 
         button_row = QHBoxLayout()
         self.reset_button = QPushButton("Reset to defaults")
@@ -1351,6 +1487,30 @@ class ShortcutsDialog(QDialog):
             QDialog {{
                 background: #1c1f24;
             }}
+            /* Keep the scroll area + its viewport + inner widget on the dialog's
+               dark base (they default to the light palette otherwise). */
+            QScrollArea#shortcutsScroll, QScrollArea#shortcutsScroll > QWidget,
+            QWidget#shortcutsContent {{
+                background: #1c1f24;
+                border: none;
+            }}
+            QScrollArea#shortcutsScroll QScrollBar:vertical {{
+                background: #1c1f24;
+                width: 11px;
+                margin: 0px;
+            }}
+            QScrollArea#shortcutsScroll QScrollBar::handle:vertical {{
+                background: #3a3f46;
+                border-radius: 5px;
+                min-height: 28px;
+            }}
+            QScrollArea#shortcutsScroll QScrollBar::handle:vertical:hover {{
+                background: #4a4f57;
+            }}
+            QScrollArea#shortcutsScroll QScrollBar::add-line:vertical,
+            QScrollArea#shortcutsScroll QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
             QLabel {{
                 color: #f4f4f5;
                 font-size: {base}pt;
@@ -1449,7 +1609,11 @@ _REDEFINE_QSS = _DARK_DIALOG_QSS + """
 #redefineDialog QLabel#redefineHeader { color: #aeb3bd; font-weight: 700; }
 #redefineDialog QLabel#redefineClass { color: #ffffff; font-weight: 700; font-size: 11pt; }
 #redefineDialog QLabel#redefineCount { color: #c2c6ce; }
-#redefineDialog QComboBox { min-width: 210px; padding: 5px 8px; }
+#redefineDialog QComboBox { min-width: 150px; padding: 5px 8px; }
+/* The scroll area + its viewport + the inner container default to the light
+   palette base (the bright table). Darken all three to match the dialog. */
+#redefineDialog QScrollArea, #redefineDialog QScrollArea > QWidget { background: #1d2024; border: none; }
+#redefineContainer { background: #1d2024; }
 #redefineRow { border-bottom: 1px solid #2c3036; }
 """
 
@@ -1496,7 +1660,10 @@ class RedefineDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Only show a horizontal scrollbar when a row's text is genuinely too wide.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         container = QWidget()
+        container.setObjectName("redefineContainer")
         grid = QGridLayout(container)
         grid.setContentsMargins(2, 2, 2, 2)
         grid.setHorizontalSpacing(16)
@@ -1598,6 +1765,11 @@ class PyQtAnnotationReview(QMainWindow):
         self.annotation_opacity = 0.30
         # Set True once any annotation vertex has been dragged; cleared on load.
         self._dirty = False
+        # Which level files have unsaved edits (per-level dirty tracking). The
+        # master ``_dirty`` flag mirrors ``bool(self._dirty_levels)``.
+        self._dirty_levels: set[int] = set()
+        # True while the sidebar shows the redefine "assign a class" catalog panel.
+        self._redefine_panel_active = False
         # Undo/redo history of geometry edit records ({annotation, before, after, image_index}).
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
@@ -1932,6 +2104,7 @@ class PyQtAnnotationReview(QMainWindow):
             }
             """
         )
+        image_selector_view.setItemDelegate(RedefineRowDelegate(image_selector_view))
         self.image_selector.setView(image_selector_view)
         popup = self.image_selector.view().window()
         popup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -2160,6 +2333,11 @@ class PyQtAnnotationReview(QMainWindow):
         self.action_close_project = QAction("Close project", self)
         self.action_close_project.triggered.connect(self._close_project)
         project_menu.addAction(self.action_close_project)
+        self.action_export_zip = QAction("Export as zip…", self)
+        self.action_export_zip.setToolTip("Bundle the whole project (images + level JSONs) into one shareable zip")
+        self.action_export_zip.triggered.connect(self._export_project_zip)
+        self.action_export_zip.setEnabled(False)
+        project_menu.addAction(self.action_export_zip)
         project_menu.addSeparator()
         self.action_redefine = QAction("Redefine classes…", self)
         self.action_redefine.setToolTip("Assign imported off-catalog classes to a level + existing class")
@@ -2315,6 +2493,8 @@ class PyQtAnnotationReview(QMainWindow):
             self.view_stack.setCurrentIndex(1 if has_project else 0)
         if hasattr(self, "action_close_project"):
             self.action_close_project.setEnabled(has_project)
+        if hasattr(self, "action_export_zip"):
+            self.action_export_zip.setEnabled(has_project)
         if hasattr(self, "import_menu"):
             self.import_menu.setEnabled(has_project)
             # Annotations need images to attach to: greyed until the project has any.
@@ -2331,7 +2511,70 @@ class PyQtAnnotationReview(QMainWindow):
         self._refresh_canvas_placeholder()
         self._update_redefine_action()
 
+    def _ask_unsaved_resolution(self, levels_text: str) -> str:
+        """Modal Save all / Discard / Cancel for unsaved edits; returns the choice id.
+
+        Split out from the guard so headless tests can stub the modal (it blocks
+        forever under the offscreen platform).
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.NoIcon)
+        box.setWindowTitle("Unsaved changes")
+        box.setText(f"You have unsaved edits in {levels_text}.\nSave them first?")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.addButton("Save all", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setStyleSheet(_DARK_DIALOG_QSS + "QPushButton { min-width: 84px; }")
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn:
+            return "cancel"
+        if clicked is discard_btn:
+            return "discard"
+        return "save"
+
+    def _confirm_discard_unsaved(self, action: str) -> bool:
+        """Return True if it's OK to proceed past unsaved edits (save/discard chosen)."""
+        if self.project is None or not self._dirty:
+            return True
+        levels_text = ", ".join(f"L{n}" for n in sorted(self._dirty_levels)) or "this project"
+        choice = self._ask_unsaved_resolution(levels_text)
+        if choice == "cancel":
+            return False
+        if choice == "save":
+            if not self.annotation_root:
+                return False
+            ok, _total, _names = self._persist_all_levels()
+            return ok
+        return True  # discard
+
+    def _export_project_zip(self) -> None:
+        """Bundle the open project into one shareable zip (flushing level edits first)."""
+        if self.project is None:
+            return
+        default = os.path.join(self.last_opened_directory or str(Path.cwd()), f"{self.project.name}.zip")
+        dest, _filter = QFileDialog.getSaveFileName(
+            self, "Export project as zip", default, "Zip archives (*.zip);;All files (*.*)"
+        )
+        if not dest:
+            return
+        # Flush in-memory level edits so the archive matches the on-screen state.
+        if self.dataset is not None and self.annotation_root:
+            ok, _total, _names = self._persist_all_levels()
+            if not ok:
+                return
+        try:
+            out = self.project.export_zip(dest)
+        except ProjectError as error:
+            self._show_message(str(error))
+            return
+        self._save_last_opened_directory(dest)
+        self._show_message(f"Exported project to\n{out.name}")
+
     def _new_project(self) -> None:
+        if not self._confirm_discard_unsaved("start a new project"):
+            return
         # One step using the NATIVE Windows explorer: its "Save As" dialog is real
         # explorer with a filename field, so the user browses to the destination
         # and types the project name in the bottom box (no separate name prompt).
@@ -2352,6 +2595,8 @@ class PyQtAnnotationReview(QMainWindow):
         self._activate_project(project)
 
     def _open_project(self) -> None:
+        if not self._confirm_discard_unsaved("open another project"):
+            return
         folder = QFileDialog.getExistingDirectory(
             self, "Open project folder", self.last_opened_directory or str(Path.cwd())
         )
@@ -2369,18 +2614,27 @@ class PyQtAnnotationReview(QMainWindow):
         """Make ``project`` the open project and load its images/levels into the session."""
         self.project = project
         self._sessions.clear()  # drop any previous project's per-mode sessions
+        # Rescue any stashed orphans whose image is already present (e.g. ones a
+        # past routing bug stashed despite the image being in the project) before
+        # we read the level files into the session.
+        try:
+            project.promote_pending()
+        except ProjectError:
+            pass
         self._apply_project_session()
         self._update_project_chrome()
 
     def _close_project(self) -> None:
         if self.project is None:
             return
-        # TODO(Stage G): warn on unsaved changes before closing.
+        if not self._confirm_discard_unsaved("close the project"):
+            return
         self.project = None
         self._sessions.clear()
         self._reset_session_state()
         self.canvas.set_idle()
         self.current_overlay_items = []
+        self._apply_mode_chrome()  # project gone: hide level selector again in validation
         self._populate_image_selector()
         self._update_status_labels()
         self._update_action_buttons()
@@ -2399,6 +2653,7 @@ class PyQtAnnotationReview(QMainWindow):
         self._cleanup_temp_extraction()
         self._rle_polygon_cache.clear()
         self._dirty = False
+        self._dirty_levels.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.dataset = {"annotation": True}  # truthy sentinel so shared guards pass
@@ -2418,6 +2673,15 @@ class PyQtAnnotationReview(QMainWindow):
             self.index = max(0, min(self.index, len(self.images) - 1))
         self._load_existing_level_files()
         self._populate_image_selector()
+        # A project is now open: reveal the level selector + per-level controls
+        # for the current mode (opening a project no longer requires toggling the
+        # mode buttons first to surface the L1/L2/L3 row).
+        self._apply_mode_chrome()
+        # Fill the sidebar for the current mode (validation lists the level catalog).
+        if self.mode == "annotation":
+            self._populate_level_classes()
+        else:
+            self._populate_class_checkboxes()
         if self.images:
             self._load_current_image(reset_fit=True)
         else:
@@ -2589,17 +2853,25 @@ class PyQtAnnotationReview(QMainWindow):
                     continue
                 buckets[level].setdefault(basename, []).append(converted)
 
-        present = set(self.project.basename_to_id().keys())
         existing_stores = {lvl: self.project.read_level(lvl) for lvl in levels.LEVEL_IDS}
 
         additions: list[tuple[int, str, list]] = []   # present, no existing -> just add
         conflicts: list[tuple[int, str, list]] = []   # present, existing -> ask
         orphans: list[tuple[int, str, list]] = []     # image absent -> stash
         for level, by_name in buckets.items():
-            for basename, anns in by_name.items():
-                if basename not in present:
-                    orphans.append((level, basename, anns))
-                elif existing_stores[level].get(basename):
+            for source_basename, anns in by_name.items():
+                # Identity is by stable_image_id (the same key import/dedup use),
+                # NOT exact filename: the same photo can be re-exported under a new
+                # prefix (e.g. "<uuidA>-PHOTO.jpg" vs "<uuidB>-PHOTO.jpg") yet share
+                # an id. Matching on the raw string would wrongly stash an
+                # already-present image. Resolve to the registry's own basename so
+                # the annotation lands on the image the project actually holds.
+                record = self.project.image_record(stable_image_id(source_basename))
+                if record is None:
+                    orphans.append((level, source_basename, anns))
+                    continue
+                basename = os.path.basename(str(record["file_name"]))
+                if existing_stores[level].get(basename):
                     conflicts.append((level, basename, anns))
                 else:
                     additions.append((level, basename, anns))
@@ -3122,12 +3394,40 @@ class PyQtAnnotationReview(QMainWindow):
 
     def _populate_class_checkboxes(self) -> None:
         self._clear_class_checkboxes()
+        # On a project, validation colours the bubbles from the level catalog, but
+        # the LIST is built from the classes actually present on the current image
+        # (see _set_validation_level_class_items), like plain validation mode.
+        level_colors = (
+            levels.level_class_colors(self.annotation_level)
+            if (self.project is not None and self.mode == "validation")
+            else {}
+        )
         for category_id, category_name in self.current_class_items:
-            bubble = ClassBubbleButton(category_id, str(category_name), color_for_class(str(category_name), int(category_id)), self._on_bubble_color_changed, self.class_list_container)
+            color = color_for_class(str(category_name), int(category_id), level_colors.get(str(category_name)))
+            bubble = ClassBubbleButton(category_id, str(category_name), color, self._on_bubble_color_changed, self.class_list_container)
             bubble.setChecked(self.visible_by_category.get(category_id, True))
             bubble.toggled.connect(lambda checked, cid=category_id: self._on_class_toggled(cid, checked))
             self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, bubble)
             self.class_checkboxes[category_id] = bubble
+
+    def _set_validation_level_class_items(self) -> None:
+        """Build the validation sidebar from the classes PRESENT in the current
+        image's active-level annotations (not the whole level catalog)."""
+        level = self.annotation_level
+        seen: dict[int, str] = {}
+        for annotation in self._current_level_annotations():
+            category_id = annotation.get("category_id")
+            if category_id is None or category_id in seen:
+                continue
+            name = levels.class_name_for_category(level, category_id)
+            if name is None:
+                continue
+            seen[category_id] = name
+        items = sorted(seen.items(), key=lambda kv: str(kv[1]).lower())
+        self.current_class_items = [(cid, name) for cid, name in items]
+        self.current_category_ids = [cid for cid, _ in items]
+        for category_id in self.current_category_ids:
+            self.visible_by_category.setdefault(category_id, True)
 
     def _show_message(self, text: str, title: str = "Annotation Workbench") -> None:
         message_box = QMessageBox(self)
@@ -3234,6 +3534,7 @@ class PyQtAnnotationReview(QMainWindow):
         self._rle_polygon_cache.clear()
 
         self._dirty = False
+        self._dirty_levels.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.dataset = loaded_dataset
@@ -3392,6 +3693,36 @@ class PyQtAnnotationReview(QMainWindow):
         self._redo_stack = []
         self._dirty = False
 
+    def _apply_mode_chrome(self) -> None:
+        """Show/hide the mode- and project-dependent sidebar controls.
+
+        Pulled out of :meth:`_set_mode` so it can also run on project
+        activation/close — opening a project must reveal the L1/L2/L3 selector
+        immediately, without first toggling Validation/Annotate by hand.
+        """
+        is_annotation = self.mode == "annotation"
+        has_project = self.project is not None
+        # In a project both modes review the same per-level data, so the L1/L2/L3
+        # selector is shown for validation too (it picks which level to review).
+        self.level_selector_widget.setVisible(is_annotation or has_project)
+        # Show-all / hide-all only make sense for multi-visibility validation.
+        self.class_action_widget.setVisible(not is_annotation)
+        # Standalone open buttons are superseded by the project import menu; keep
+        # them hidden (loading now flows through New/Open project + Import).
+        self.open_button.setVisible(False)
+        self.open_images_json_button.setVisible(False)
+        self.open_images_button.setVisible(False)
+        self.open_dataset_button.setVisible(False)
+        self.draw_button.setVisible(is_annotation)
+        # Whole-object select+delete works in both project modes (validation
+        # reviewers remove wrong objects too); gated to projects so the dormant
+        # legacy non-project validation path is left untouched.
+        select_and_delete = is_annotation or has_project
+        self.delete_button.setVisible(select_and_delete)
+        # "Save all" writes all three level files; useful in either project mode.
+        self.save_all_button.setVisible(is_annotation or has_project)
+        self.canvas.set_select_enabled(select_and_delete)
+
     def _set_mode(self, mode: str) -> None:
         """Switch between validation (review) and annotation (draw); each keeps its own session."""
         if mode not in ("validation", "annotation"):
@@ -3414,19 +3745,7 @@ class PyQtAnnotationReview(QMainWindow):
         # Keep the toggle buttons in sync (also covers programmatic calls).
         self.validation_mode_button.setChecked(not is_annotation)
         self.annotation_mode_button.setChecked(is_annotation)
-        self.level_selector_widget.setVisible(is_annotation)
-        # Show-all / hide-all only make sense for multi-visibility validation.
-        self.class_action_widget.setVisible(not is_annotation)
-        # Standalone open buttons are superseded by the project import menu; keep
-        # them hidden (loading now flows through New/Open project + Import).
-        self.open_button.setVisible(False)
-        self.open_images_json_button.setVisible(False)
-        self.open_images_button.setVisible(False)
-        self.open_dataset_button.setVisible(False)
-        self.draw_button.setVisible(is_annotation)
-        self.delete_button.setVisible(is_annotation)
-        self.save_all_button.setVisible(is_annotation)
-        self.canvas.set_select_enabled(is_annotation)
+        self._apply_mode_chrome()
         if not is_annotation:
             # Leaving annotation: stop drawing.
             self.draw_button.setChecked(False)
@@ -3457,6 +3776,14 @@ class PyQtAnnotationReview(QMainWindow):
             self.canvas.clear_selection()
             self._populate_level_classes()
             self._sync_draw_state()
+            self._refresh_overlay_items()
+            self._update_status_labels()
+        elif self.project is not None:
+            # Validation on a project: switching level re-reviews that level's data.
+            self.canvas.clear_selection()
+            self.visible_by_category = {}  # fresh per-level visibility
+            self._set_validation_level_class_items()
+            self._populate_class_checkboxes()
             self._refresh_overlay_items()
             self._update_status_labels()
 
@@ -3532,6 +3859,7 @@ class PyQtAnnotationReview(QMainWindow):
         self._cleanup_temp_extraction()
         self._rle_polygon_cache.clear()
         self._dirty = False
+        self._dirty_levels.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
         # Truthy sentinel so shared guards (which test ``self.dataset``) pass.
@@ -3648,6 +3976,7 @@ class PyQtAnnotationReview(QMainWindow):
     def _apply_converted_dataset(self, root: str, images_path: str, images: list, annotations_by_image_id: dict, categories_by_id: dict) -> None:
         self._cleanup_temp_extraction()
         self._rle_polygon_cache.clear()
+        self._dirty_levels.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.dataset = {"annotation": True}
@@ -3680,9 +4009,10 @@ class PyQtAnnotationReview(QMainWindow):
                     dropped += 1
                     continue
                 self.annotation_store[level].setdefault(basename, []).append(new_annotation)
+                self._dirty_levels.add(level)
                 converted += 1
 
-        self._dirty = converted > 0
+        self._dirty = bool(self._dirty_levels)
         self._populate_image_selector()
         self._load_current_image(reset_fit=True)
         self._update_status_labels()
@@ -3703,8 +4033,22 @@ class PyQtAnnotationReview(QMainWindow):
         self.image_selector.blockSignals(True)
         self.image_selector.clear()
         
-        # Add all images to the selector
+        # Images that still carry an off-catalog object awaiting redefinition;
+        # their rows are coloured red so they're easy to find. Match by
+        # stable_image_id (the entry's file_name can differ from the registry's
+        # across re-exports) -- the same identity rule import/routing use.
+        redefine_ids: set[int] = set()
+        if self.project is not None:
+            for entry in self.project.read_unmapped():
+                try:
+                    redefine_ids.add(int(entry.get("stable_image_id")))
+                except (TypeError, ValueError):
+                    redefine_ids.add(stable_image_id(os.path.basename(str(entry.get("file_name", "")))))
+
+        # Add all images to the selector, each prefixed with its position (matching
+        # the "N/total" counter in the status bar) so the list is easy to scan.
         if self.images:
+            total = len(self.images)
             for i, image_info in enumerate(self.images):
                 if isinstance(image_info, dict):
                     full_path = image_info.get("file_name", f"Image {i+1}")
@@ -3712,7 +4056,12 @@ class PyQtAnnotationReview(QMainWindow):
                     filename = os.path.basename(str(full_path))
                 else:
                     filename = f"Image {i+1}"
-                self.image_selector.addItem(filename, i)
+                self.image_selector.addItem(f"{i + 1}/{total}  {filename}", i)
+                sid = image_info.get("id") if isinstance(image_info, dict) else None
+                if sid is None:
+                    sid = stable_image_id(filename)
+                if int(sid) in redefine_ids:
+                    self.image_selector.setItemData(i, True, RedefineRowDelegate.FLAG_ROLE)
             
             # Keep the placeholder text visible by not setting current index
             # This way users always see "Select image" in the combo box
@@ -3748,8 +4097,8 @@ class PyQtAnnotationReview(QMainWindow):
     def _next_image(self) -> None:
         if not self.images:
             return
-        # Annotation sessions never auto-close; just stop at the last image.
-        if self.mode == "annotation" and self.index >= len(self.images) - 1:
+        # Project sessions (either mode) never auto-close; stop at the last image.
+        if (self.mode == "annotation" or self.project is not None) and self.index >= len(self.images) - 1:
             return
         self.index += 1
         if self.index >= len(self.images):
@@ -3807,6 +4156,7 @@ class PyQtAnnotationReview(QMainWindow):
         self.current_overlay_items = []
         self._rle_polygon_cache.clear()
         self._dirty = False
+        self._dirty_levels.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_action_buttons()
@@ -3891,13 +4241,19 @@ class PyQtAnnotationReview(QMainWindow):
 
         return overlay_items
 
-    def _build_annotation_overlay_items(self, annotations, level: int) -> list[dict]:
-        """Overlays for the active annotation level (other levels are hidden)."""
+    def _build_annotation_overlay_items(self, annotations, level: int, respect_visibility: bool = False) -> list[dict]:
+        """Overlays for the active level (other levels hidden).
+
+        ``respect_visibility`` skips classes hidden via the validation toggles;
+        annotation mode passes False (it always shows the whole active level).
+        """
         geometry = levels.level_geometry(level)
         class_colors = levels.level_class_colors(level)
         overlay_items: list[dict] = []
         for annotation in annotations:
             category_id = annotation.get("category_id")
+            if respect_visibility and not self.visible_by_category.get(category_id, True):
+                continue
             class_name = levels.class_name_for_category(level, category_id) if category_id is not None else None
             label = str(class_name) if class_name else str(category_id)
             color = color_for_class(str(class_name), int(category_id) if category_id is not None else 0, class_colors.get(str(class_name)))
@@ -3941,14 +4297,19 @@ class PyQtAnnotationReview(QMainWindow):
         return []
 
     def _pending_redefine_overlays(self, level: int) -> list[dict]:
-        """Highlighted, read-only overlays for classes parked in ``level`` (Redefine)."""
+        """Highlighted, read-only overlays for unredefined classes shown on ``level``.
+
+        Includes entries parked in this level AND not-yet-parked entries (which
+        show on every level until assigned), so a redefinable object is visible
+        regardless of the active level until the user picks its real one.
+        """
         if self.project is None:
             return []
         basename = self._current_image_basename()
         if not basename:
             return []
         overlays: list[dict] = []
-        for entry in self.project.unmapped_entries_for_level(level):
+        for entry in self.project.unmapped_entries_visible_on_level(level):
             if os.path.basename(str(entry.get("file_name", ""))) != basename:
                 continue
             points = self._raw_geometry_points(entry.get("source_annotation", {}) or {})
@@ -3963,6 +4324,8 @@ class PyQtAnnotationReview(QMainWindow):
                 "annotation": None,
                 "editable": False,
                 "pending_redefine": True,
+                "redefine_entry_id": entry.get("id"),  # selectable -> per-object resolve
+                "redefine_raw_class": str(entry.get("raw_class", "")),
             })
         return overlays
 
@@ -3977,6 +4340,19 @@ class PyQtAnnotationReview(QMainWindow):
             self.canvas.update()
             self._update_status_labels()
             return
+        if self.project is not None:
+            # Validation on a project shares annotation mode's per-level store, but
+            # honours the per-class visibility toggles (and still shows parked
+            # "redefine" overlays so they're visible in this lens too).
+            annotations = self._current_level_annotations()
+            self.current_annotations = annotations
+            overlays = self._build_annotation_overlay_items(annotations, self.annotation_level, respect_visibility=True)
+            overlays += self._pending_redefine_overlays(self.annotation_level)
+            self.current_overlay_items = overlays
+            self.canvas.set_overlay_items(self.current_overlay_items)
+            self.canvas.update()
+            self._update_status_labels()
+            return
         if not self.dataset:
             return
         self.current_overlay_items = self._build_overlay_items(self.current_annotations)
@@ -3984,13 +4360,27 @@ class PyQtAnnotationReview(QMainWindow):
         self.canvas.update()
         self._update_status_labels()
 
+    def _mark_dirty_level(self, level: int | None = None) -> None:
+        """Flag a level (default: the active one) as having unsaved edits."""
+        self._dirty_levels.add(self.annotation_level if level is None else int(level))
+        self._dirty = True
+
+    def _unsaved_suffix(self) -> str:
+        """Status-bar tail naming the dirty levels (project) or a generic note."""
+        if not self._dirty:
+            return ""
+        if self.project is not None and self._dirty_levels:
+            return "   ·   ● unsaved: " + ", ".join(f"L{n}" for n in sorted(self._dirty_levels))
+        return "   ·   ● unsaved edits"
+
     def _on_annotations_changed(self, record: dict | None = None) -> None:
         """A vertex was dragged on the canvas; record the edit for undo and refresh."""
         if record is not None:
             record["image_index"] = self.index
+            record.setdefault("level", self.annotation_level)
             self._undo_stack.append(record)
             self._redo_stack.clear()
-        self._dirty = bool(self._undo_stack)
+            self._mark_dirty_level(record["level"])
         self._update_action_buttons()
         self._update_status_labels()
 
@@ -4067,17 +4457,93 @@ class PyQtAnnotationReview(QMainWindow):
         }
         self._undo_stack.append(record)
         self._redo_stack.clear()
-        self._dirty = True
+        self._mark_dirty_level(self.annotation_level)
         self._refresh_overlay_items()
         self._update_action_buttons()
         self._update_status_labels()
 
     def _on_selection_changed(self) -> None:
-        self.delete_button.setEnabled(self.mode == "annotation" and self.canvas.selected_annotation() is not None)
+        # A selected parked-redefine object swaps the sidebar to the "assign a
+        # class" catalog panel; any other selection restores the normal class list.
+        redefine_item = self.canvas.selected_redefine()
+        if redefine_item is not None:
+            self._show_redefine_assign_panel(redefine_item)
+            self.delete_button.setEnabled(False)
+            return
+        if self._redefine_panel_active:
+            self._redefine_panel_active = False
+            if self.project is not None and self.mode == "validation":
+                self._set_validation_level_class_items()
+            self._populate_class_checkboxes()
+        can_delete = self.mode == "annotation" or self.project is not None
+        self.delete_button.setEnabled(can_delete and self.canvas.selected_annotation() is not None)
+
+    def _show_redefine_assign_panel(self, item: dict) -> None:
+        """Show the active level's catalog so a click assigns the selected redefine object."""
+        entry_id = item.get("redefine_entry_id")
+        level = self.annotation_level
+        self._redefine_panel_active = True
+        self._clear_class_checkboxes()
+        raw = str(item.get("redefine_raw_class") or str(item.get("label", "")).split(" • ")[0])
+        self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, self._make_section(f"ASSIGN “{raw}”"))
+        note = QLabel("Click a class to reclassify this object (it leaves the redefine list).")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, note)
+        class_colors = levels.level_class_colors(level)
+        handle_height = max(30, int(round(30 * DPI_SCALE)))
+        for header, class_list in levels.level_groups(level):
+            self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, self._make_section(header))
+            for class_name, default_hex in class_list:
+                category_id = levels.category_id_for_class(level, class_name) or 0
+                color = color_for_class(class_name, category_id, class_colors.get(class_name, default_hex))
+                button = OutlinedTextButton(class_name)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.setMinimumHeight(handle_height)
+                button.setStyleSheet(
+                    f"QPushButton {{ background-color: rgba({color.red()},{color.green()},{color.blue()},235);"
+                    " border:1px solid rgba(0,0,0,0.22); border-radius:14px;"
+                    " padding:7px 12px; text-align:left; font-weight:600; }"
+                    " QPushButton:hover { border:1px solid rgba(0,0,0,0.45); }"
+                )
+                button.clicked.connect(
+                    lambda _checked=False, eid=entry_id, name=class_name: self._resolve_redefine_object(eid, name)
+                )
+                self.class_list_layout.insertWidget(self.class_list_layout.count() - 1, button)
+
+    def _resolve_redefine_object(self, entry_id, class_name: str) -> None:
+        """Reclassify ONE parked redefine object into ``class_name`` on the active level."""
+        if self.project is None or not entry_id:
+            return
+        level = self.annotation_level
+        entry = self.project.get_unmapped_entry(entry_id)
+        if entry is None:  # already resolved elsewhere
+            self.canvas.clear_selection()
+            return
+        converted = self._convert_source_annotation(entry.get("source_annotation", {}) or {}, level, class_name)
+        if converted is None:
+            self._show_message("Could not assign: this object has no usable geometry for this level.")
+            return
+        basename = os.path.basename(str(entry.get("file_name", ""))) or self._current_image_basename()
+        store = self.annotation_store[level].setdefault(basename, [])
+        store.append(converted)
+        ok, _count, _name = self._write_level_file(level)  # commit this level to disk
+        if not ok:
+            store.remove(converted)  # rollback the in-memory add on write failure
+            return
+        self.project.pop_unmapped_entry(entry_id)  # commit: drop it from the stash
+        self._dirty_levels.discard(level)  # the write persisted this level
+        self._dirty = bool(self._dirty_levels)
+        self.canvas.clear_selection()  # restores the normal sidebar (rebuilds class list)
+        self._populate_image_selector()  # clears this image's red row if nothing's left
+        self._refresh_overlay_items()
+        self._update_action_buttons()
+        self._update_status_labels()
+        self._update_redefine_action()
 
     def _delete_selected_annotation(self) -> bool:
         """Remove the selected annotation from the active level's store (undoable)."""
-        if self.mode != "annotation":
+        if self.mode != "annotation" and self.project is None:
             return False
         annotation = self.canvas.selected_annotation()
         if annotation is None:
@@ -4095,7 +4561,7 @@ class PyQtAnnotationReview(QMainWindow):
         }
         self._undo_stack.append(record)
         self._redo_stack.clear()
-        self._dirty = True
+        self._mark_dirty_level(record["level"])
         self.canvas.clear_selection()
         self._refresh_overlay_items()
         self._update_action_buttons()
@@ -4107,9 +4573,11 @@ class PyQtAnnotationReview(QMainWindow):
         self.redo_button.setEnabled(bool(self._redo_stack))
         has_dataset = self.dataset is not None
         is_annotation = self.mode == "annotation"
+        # In a project both modes save per-level (current level / all levels).
+        per_level = is_annotation or self.project is not None
         self.save_button.setEnabled(has_dataset)
-        self.save_all_button.setEnabled(has_dataset and is_annotation)
-        save_label = "● Save level" if (has_dataset and self._dirty) else ("Save level" if is_annotation else "Save")
+        self.save_all_button.setEnabled(has_dataset and per_level)
+        save_label = "● Save level" if (has_dataset and self._dirty) else ("Save level" if per_level else "Save")
         self.save_button.setText(save_label)
 
     def _restore_snapshot(self, record: dict, key: str) -> None:
@@ -4154,7 +4622,8 @@ class PyQtAnnotationReview(QMainWindow):
         record = self._undo_stack.pop()
         self._redo_stack.append(record)
         self._apply_record(record, undo=True)
-        self._dirty = bool(self._undo_stack)
+        # An undo changes the level's data vs disk, so it stays dirty until saved.
+        self._mark_dirty_level(record.get("level"))
         self._update_action_buttons()
         self._update_status_labels()
 
@@ -4164,7 +4633,7 @@ class PyQtAnnotationReview(QMainWindow):
         record = self._redo_stack.pop()
         self._undo_stack.append(record)
         self._apply_record(record, undo=False)
-        self._dirty = bool(self._undo_stack)
+        self._mark_dirty_level(record.get("level"))
         self._update_action_buttons()
         self._update_status_labels()
 
@@ -4234,20 +4703,30 @@ class PyQtAnnotationReview(QMainWindow):
             return False, 0, path.name
         return True, len(coco["annotations"]), path.name
 
-    def _save_all_levels(self) -> None:
-        if not self.dataset or self.mode != "annotation" or not self.annotation_root:
-            return
+    def _persist_all_levels(self) -> tuple[bool, int, list[str]]:
+        """Write all three level files (no popup); clear dirty state. (ok, total, names)."""
         total = 0
         names: list[str] = []
         for level in levels.LEVEL_IDS:
             ok, count, name = self._write_level_file(level)
             if not ok:
-                return
+                return False, total, names
             total += count
             names.append(name)
+        self._dirty_levels.clear()
         self._dirty = False
         self._update_action_buttons()
         self._update_status_labels()
+        return True, total, names
+
+    def _save_all_levels(self) -> None:
+        if not self.dataset or not self.annotation_root:
+            return
+        if self.mode != "annotation" and self.project is None:
+            return
+        ok, total, names = self._persist_all_levels()
+        if not ok:
+            return
         self._show_message(f"Saved {total} annotations to:\n{', '.join(names)}")
 
     def _save_dataset(self) -> None:
@@ -4255,13 +4734,16 @@ class PyQtAnnotationReview(QMainWindow):
         if not self.dataset:
             return
 
-        if self.mode == "annotation":
+        if self.mode == "annotation" or self.project is not None:
+            # Both project modes save the active level back to its level{N}.json.
             if not self.annotation_root:
                 return
             ok, count, name = self._write_level_file(self.annotation_level)
             if not ok:
                 return
-            self._dirty = False
+            # Saving one level clears only that level's dirty flag.
+            self._dirty_levels.discard(self.annotation_level)
+            self._dirty = bool(self._dirty_levels)
             self._update_action_buttons()
             self._update_status_labels()
             self._show_message(f"Saved {count} annotations to {name}")
@@ -4296,6 +4778,7 @@ class PyQtAnnotationReview(QMainWindow):
             self._show_message(f"Could not save: {error}")
             return
 
+        self._dirty_levels.clear()
         self._dirty = False
         self._update_action_buttons()
         self._update_status_labels()
@@ -4338,6 +4821,11 @@ class PyQtAnnotationReview(QMainWindow):
         title = f"{self.index + 1}/{len(self.images)} - {os.path.basename(self.current_image_name)}"
         self.setWindowTitle(title)
         self._sync_canvas_state()
+        # Validation sidebar lists only the classes present on THIS image (rebuilt
+        # per image, like plain validation), coloured from the level catalog.
+        if self.project is not None and self.mode == "validation":
+            self._set_validation_level_class_items()
+            self._populate_class_checkboxes()
         self._refresh_overlay_items()
         if reset_fit:
             self.canvas.fit_to_view()
@@ -4350,7 +4838,9 @@ class PyQtAnnotationReview(QMainWindow):
             self.canvas.set_idle()
             return
 
-        if self.mode == "annotation":
+        if self.mode == "annotation" or self.project is not None:
+            # Both project modes share the per-level loader (clamp at the last
+            # image, never auto-close — closing would discard the project session).
             self._load_current_image_annotation(reset_fit)
             return
 
@@ -4427,8 +4917,7 @@ class PyQtAnnotationReview(QMainWindow):
                 parts.insert(1, f"{self.index + 1}/{len(self.images)}")
             parts.append(f"class: {active_name}" if active_name else "class: none")
             text = "   ·   ".join(parts)
-            if self._dirty:
-                text += "   ·   ● unsaved edits"
+            text += self._unsaved_suffix()
             self.status_label.setText(text)
             self.copy_id_button.setEnabled(bool(self.images))
             return
@@ -4440,22 +4929,31 @@ class PyQtAnnotationReview(QMainWindow):
         self.copy_id_button.setEnabled(True)
         zoom = int(round(self.canvas.zoom * 100))
 
+        # On a project, validation reviews one level; show it and the level's
+        # catalog size rather than the (unused) flat ``class_items`` count.
+        if self.project is not None:
+            level_part = f"L{self.annotation_level} · {levels.level_title(self.annotation_level)}"
+            class_count = len(self.current_class_items)  # classes present on this image
+        else:
+            level_part = None
+            class_count = len(self.class_items)
+
         if self.images:
             current_name = os.path.basename(self.current_image_name) if self.current_image_name else ""
             visible_count = len(self.current_overlay_items)
             parts = [
                 f"{self.index + 1}/{len(self.images)}",
                 current_name,
-                f"{len(self.class_items)} classes",
+                level_part,
+                f"{class_count} classes",
                 f"{visible_count} visible",
                 f"Zoom {zoom}%",
             ]
         else:
-            parts = [f"{len(self.images)} images", f"{len(self.class_items)} classes", f"Zoom {zoom}%"]
+            parts = [level_part, f"{len(self.images)} images", f"{class_count} classes", f"Zoom {zoom}%"]
 
         text = "   ·   ".join(part for part in parts if part)
-        if self._dirty:
-            text += "   ·   ● unsaved edits"
+        text += self._unsaved_suffix()
         self.status_label.setText(text)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
@@ -4477,7 +4975,7 @@ class PyQtAnnotationReview(QMainWindow):
                 return
 
         # Delete/Backspace removes the selected annotation (when not mid-drawing).
-        if self.mode == "annotation" and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        if (self.mode == "annotation" or self.project is not None) and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             if self._delete_selected_annotation():
                 event.accept()
                 return
@@ -4491,6 +4989,9 @@ class PyQtAnnotationReview(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if not self._confirm_discard_unsaved("quit"):
+            event.ignore()
+            return
         self._cleanup_temp_extraction()
         for snapshot in self._sessions.values():
             stashed = snapshot.get("temp_extraction")
