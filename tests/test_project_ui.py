@@ -550,6 +550,7 @@ def test_insert_vertex_on_nearest_edge() -> None:
         window.annotation_store[1].setdefault(basename, []).append(ann)
         window._refresh_overlay_items()
         window.canvas.set_edit_enabled(True)
+        window.canvas._set_selected(ann)  # handles/edges are exposed for the SELECTED object only
         assert window.canvas.has_image  # _fit_display_rect needs a loaded pixmap
 
         # Screen point at the midpoint of the top edge (image (5, 0)).
@@ -562,6 +563,40 @@ def test_insert_vertex_on_nearest_edge() -> None:
         assert window.canvas._selected_vertex is not None
         window._undo()
         assert len(ann["segmentation"][0]) == 8
+
+
+def test_vertex_handles_are_selected_object_only() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+        a = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        b = {"category_id": 1, "segmentation": [[20, 20, 30, 20, 30, 30, 20, 30]], "bbox": [20, 20, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).extend([a, b])
+        window._refresh_overlay_items()
+        canvas = window.canvas
+        canvas.set_edit_enabled(True)
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        corner_a = QPointF(ix + 0 * z, iy + 0 * z)   # a corner of object A
+        corner_b = QPointF(ix + 20 * z, iy + 20 * z)  # a corner of object B
+
+        # Nothing selected -> no grabbable handle anywhere (handles are hidden).
+        assert canvas._hit_test_vertex(corner_a) is None
+
+        # Select A -> only A's corners are grabbable; B's stay inert.
+        canvas._set_selected(a)
+        hit = canvas._hit_test_vertex(corner_a)
+        assert hit is not None and hit[0].get("annotation") is a
+        assert canvas._hit_test_vertex(corner_b) is None
+
+        # Selecting B flips it: now only B's corners are grabbable.
+        canvas._set_selected(b)
+        assert canvas._hit_test_vertex(corner_a) is None
+        hit_b = canvas._hit_test_vertex(corner_b)
+        assert hit_b is not None and hit_b[0].get("annotation") is b
 
 
 class _FakeMouse:
@@ -624,6 +659,94 @@ def test_pending_polygon_point_move_select_delete_insert() -> None:
         # Delete removes the selected pending point.
         assert canvas.delete_selected_pending_vertex() is True
         assert len(canvas._poly_points) == 4
+
+
+def test_rotate_selected_l2_box_drag_and_undo() -> None:
+    import math
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(2)  # L2 = rotated boxes
+        canvas = window.canvas
+        assert canvas.has_image
+
+        # An axis-aligned L2 box centred at (5, 5); no segmentation yet.
+        ann = {"category_id": 1, "bbox": [0, 0, 10, 10], "area": 100, "rotation": 0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        canvas.set_edit_enabled(True)
+        canvas._set_selected(ann)
+
+        item = canvas._rotation_target()
+        assert item is not None and item["shape"] == "bbox"  # offered for L2 boxes
+        (hx, hy), _mid = canvas._rotation_handle_image_pos(item)
+        assert abs(hx - 5.0) < 1e-6 and hy < 0.0  # handle floats straight above the box
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # Grab the handle (straight up = -90°), drag to the right of centre (0°):
+        # a +90° turn around the centre.
+        canvas.mousePressEvent(_FakeMouse(ix + hx * z, iy + hy * z, Qt.MouseButton.LeftButton))
+        assert canvas._rotate_item is item
+        off = math.hypot(hx - 5.0, hy - 5.0)
+        tx, ty = 5.0 + off, 5.0
+        canvas.mouseMoveEvent(_FakeMouse(ix + tx * z, iy + ty * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + tx * z, iy + ty * z, Qt.MouseButton.LeftButton))
+
+        assert canvas._rotate_item is None
+        assert abs(ann["rotation"] - 90.0) < 1e-3        # base 0 + 90°
+        assert ann["segmentation"] is not None           # now a real quad
+        assert item["shape"] == "polygon"                # renders/edits as a quad
+        # A 90° turn of the unit square maps corner (0,0) -> (10,0).
+        quad = ann["segmentation"][0]
+        assert abs(quad[0] - 10.0) < 1e-3 and abs(quad[1] - 0.0) < 1e-3
+
+        window._undo()  # back to the axis-aligned box
+        assert ann["rotation"] == 0
+        assert ann.get("segmentation") is None
+
+
+def test_move_whole_l2_box_drag_and_undo() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(2)  # L2 boxes are movable whole
+        canvas = window.canvas
+        assert canvas.has_image
+
+        ann = {"category_id": 1, "bbox": [0, 0, 10, 10], "area": 100, "rotation": 0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        canvas.set_edit_enabled(True)
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # Press the box body (image 5,5) and drag by (+3, +2) image units.
+        canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is not None
+        assert canvas.selected_annotation() is ann  # a body-press also selects it
+        canvas.mouseMoveEvent(_FakeMouse(ix + 8 * z, iy + 7 * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 8 * z, iy + 7 * z, Qt.MouseButton.LeftButton))
+
+        assert canvas._box_move_item is None
+        assert ann["bbox"] == [3.0, 2.0, 10.0, 10.0]  # whole box translated
+        assert ann["area"] == 100                      # translation preserves area
+
+        window._undo()
+        assert ann["bbox"] == [0, 0, 10, 10]
+
+        # A polygon body (L1) is NOT movable — pressing it only selects.
+        window._set_level(1)
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+        canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is None           # polygons don't move whole
+        assert canvas.selected_annotation() is poly
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
 
 
 def test_reclassify_selected_object_is_undoable() -> None:

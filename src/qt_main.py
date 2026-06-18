@@ -293,6 +293,23 @@ class ImageCanvas(QWidget):
         self._selected_annotation: dict | None = None
         # A parked "redefine" overlay can also be selected (to assign it a class).
         self._selected_redefine: dict | None = None
+        # Rotating a selected L2 box via its rotate handle (drag around the center).
+        self._rotate_item: dict | None = None
+        self._rotate_before: dict | None = None
+        self._rotate_center: tuple[float, float] | None = None
+        self._rotate_origin_points: list[tuple[float, float]] = []
+        self._rotate_start_angle = 0.0
+        self._rotate_base_rotation = 0.0
+        self._rotate_moved = False
+        self._rotation_hover = False
+        # Moving a whole selected L2 box by dragging its body (boxes only, not polygons).
+        self._box_move_item: dict | None = None
+        self._box_move_before: dict | None = None
+        self._box_move_origin_points: list[tuple[float, float]] = []
+        self._box_move_origin_center: tuple[float, float] | None = None
+        self._box_move_start = QPoint(0, 0)
+        self._box_move_start_image: tuple[float, float] = (0.0, 0.0)
+        self._box_move_moved = False
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -431,6 +448,7 @@ class ImageCanvas(QWidget):
             painter.drawPixmap(target, self._pixmap, source)
         self._draw_overlays(painter, image_x, image_y)
         self._draw_handles(painter, image_x, image_y)
+        self._draw_rotation_handle(painter, image_x, image_y)
         self._draw_pending(painter, image_x, image_y)
 
         title_font = QFont()
@@ -447,6 +465,16 @@ class ImageCanvas(QWidget):
             self._hover_vertex = None
             self._drag_vertex = None
             self._selected_vertex = None
+            self._rotate_item = None
+            self._rotate_center = None
+            self._rotate_origin_points = []
+            self._rotate_moved = False
+            self._rotation_hover = False
+            self._box_move_item = None
+            self._box_move_before = None
+            self._box_move_origin_points = []
+            self._box_move_origin_center = None
+            self._box_move_moved = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
@@ -665,25 +693,37 @@ class ImageCanvas(QWidget):
             iy = min(max(iy, 0.0), float(self._pixmap.height()))
         return ix, iy
 
+    def _selected_overlay_item(self) -> dict | None:
+        """The overlay item backing the currently selected annotation, if any."""
+        if self._selected_annotation is None:
+            return None
+        for item in self._overlay_items:
+            if item.get("annotation") is self._selected_annotation:
+                return item
+        return None
+
     def _hit_test_vertex(self, position) -> tuple[dict, int] | None:
-        """Return (overlay_item, vertex_index) of the editable handle under the cursor, if any."""
+        """Return (overlay_item, vertex_index) of the editable handle under the cursor, if any.
+
+        Only the SELECTED object exposes grabbable handles (like the L2 rotate
+        handle) — so editing one object's points never fights its neighbours'.
+        """
         if not self._edit_enabled or self._pixmap is None:
+            return None
+        item = self._selected_overlay_item()
+        if item is None or not item.get("editable"):
             return None
         image_x, image_y, _, _ = self._fit_display_rect()
         cursor_x, cursor_y = position.x(), position.y()
         best_hit: tuple[dict, int] | None = None
         best_distance = float(self._handle_hit_radius) ** 2
-        # Reverse so the topmost (last-drawn) handle wins on overlap.
-        for item in reversed(self._overlay_items):
-            if not item.get("editable"):
-                continue
-            for index, (point_x, point_y) in enumerate(item["points"]):
-                screen_x = image_x + point_x * self._zoom
-                screen_y = image_y + point_y * self._zoom
-                distance = (screen_x - cursor_x) ** 2 + (screen_y - cursor_y) ** 2
-                if distance <= best_distance:
-                    best_distance = distance
-                    best_hit = (item, index)
+        for index, (point_x, point_y) in enumerate(item["points"]):
+            screen_x = image_x + point_x * self._zoom
+            screen_y = image_y + point_y * self._zoom
+            distance = (screen_x - cursor_x) ** 2 + (screen_y - cursor_y) ** 2
+            if distance <= best_distance:
+                best_distance = distance
+                best_hit = (item, index)
         return best_hit
 
     def _apply_vertex_drag(self, item: dict, index: int, image_x: float, image_y: float) -> None:
@@ -821,66 +861,317 @@ class ImageCanvas(QWidget):
         """
         if not self._edit_enabled or self._pixmap is None:
             return None
+        # Insert points only on the SELECTED polygon (handles are selected-only).
+        item = self._selected_overlay_item()
+        if item is None or not item.get("vertex_editable"):
+            return None
         image_x, image_y, _, _ = self._fit_display_rect()
         px, py = position.x(), position.y()
         threshold = float(max(20, self._handle_hit_radius * 2)) ** 2
         best: tuple[dict, int, tuple[float, float]] | None = None
         best_distance = threshold
-        for item in reversed(self._overlay_items):
-            if not item.get("vertex_editable"):
-                continue
-            points = item["points"]
-            n = len(points)
-            if n < 2:
-                continue
-            for i in range(n):
-                ax, ay = points[i]
-                bx, by = points[(i + 1) % n]
-                sax, say = image_x + ax * self._zoom, image_y + ay * self._zoom
-                sbx, sby = image_x + bx * self._zoom, image_y + by * self._zoom
-                dx, dy = sbx - sax, sby - say
-                length_sq = dx * dx + dy * dy
-                t = 0.0 if length_sq == 0 else ((px - sax) * dx + (py - say) * dy) / length_sq
-                t = min(1.0, max(0.0, t))
-                proj_x, proj_y = sax + t * dx, say + t * dy
-                distance = (proj_x - px) ** 2 + (proj_y - py) ** 2
-                if distance < best_distance:
-                    best_distance = distance
-                    point = (ax + t * (bx - ax), ay + t * (by - ay))
-                    best = (item, i + 1, point)
+        points = item["points"]
+        n = len(points)
+        if n < 2:
+            return None
+        for i in range(n):
+            ax, ay = points[i]
+            bx, by = points[(i + 1) % n]
+            sax, say = image_x + ax * self._zoom, image_y + ay * self._zoom
+            sbx, sby = image_x + bx * self._zoom, image_y + by * self._zoom
+            dx, dy = sbx - sax, sby - say
+            length_sq = dx * dx + dy * dy
+            t = 0.0 if length_sq == 0 else ((px - sax) * dx + (py - say) * dy) / length_sq
+            t = min(1.0, max(0.0, t))
+            proj_x, proj_y = sax + t * dx, say + t * dy
+            distance = (proj_x - px) ** 2 + (proj_y - py) ** 2
+            if distance < best_distance:
+                best_distance = distance
+                point = (ax + t * (bx - ax), ay + t * (by - ay))
+                best = (item, i + 1, point)
         return best
 
-    def _draw_handles(self, painter: QPainter, image_x: int, image_y: int) -> None:
-        """Draw grab handles at every editable vertex so they can be dragged."""
-        if not self._edit_enabled or not self._overlay_items:
-            return
-        size = self._handle_size
-        visible = self._visible_image_rect()
+    # ----- rotation of selected L2 boxes ----------------------------------
+    def _rotation_target(self) -> dict | None:
+        """The selected overlay item if it's a rotatable L2 box in edit mode, else None."""
+        if not self._edit_enabled or self._selected_annotation is None:
+            return None
         for item in self._overlay_items:
-            if not item.get("editable"):
+            if item.get("rotatable") and item.get("annotation") is self._selected_annotation:
+                return item
+        return None
+
+    def _rotation_handle_image_pos(self, item: dict) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """((handle_x, handle_y), (edge_mid_x, edge_mid_y)) in image coords, or None.
+
+        The handle floats a fixed *screen* distance beyond the midpoint of the box's
+        first edge, along the outward direction from the box center — so it rides
+        along as the box turns and stays the same size at any zoom.
+        """
+        points = item.get("points") or []
+        center = item.get("center")
+        if len(points) < 4 or center is None:
+            return None
+        cx, cy = center
+        mx = (points[0][0] + points[1][0]) / 2.0
+        my = (points[0][1] + points[1][1]) / 2.0
+        dx, dy = mx - cx, my - cy
+        dist = math.hypot(dx, dy)
+        nx, ny = (dx / dist, dy / dist) if dist > 1e-6 else (0.0, -1.0)
+        zoom = self._zoom if self._zoom > 0 else 1.0
+        offset = (self._handle_hit_radius * 2.6) / zoom
+        return (mx + nx * offset, my + ny * offset), (mx, my)
+
+    def _hit_test_rotation_handle(self, position) -> dict | None:
+        """Return the rotatable item whose rotate handle is under the cursor, if any."""
+        item = self._rotation_target()
+        if item is None:
+            return None
+        handle = self._rotation_handle_image_pos(item)
+        if handle is None:
+            return None
+        (hx, hy), _ = handle
+        image_x, image_y, _, _ = self._fit_display_rect()
+        sx = image_x + hx * self._zoom
+        sy = image_y + hy * self._zoom
+        radius = self._handle_hit_radius
+        if (sx - position.x()) ** 2 + (sy - position.y()) ** 2 <= radius ** 2:
+            return item
+        return None
+
+    def _begin_rotation(self, item: dict, position) -> None:
+        """Start a rotate-drag of ``item`` around its center."""
+        center = item.get("center")
+        if center is None:
+            return
+        annotation = item.get("annotation")
+        self._rotate_item = item
+        self._rotate_center = (float(center[0]), float(center[1]))
+        self._rotate_origin_points = [(float(x), float(y)) for x, y in item["points"]]
+        self._rotate_before = self._snapshot_annotation(annotation)
+        self._rotate_base_rotation = float(annotation.get("rotation", 0) or 0) if annotation else 0.0
+        ix, iy = self._image_from_screen(position.x(), position.y())
+        self._rotate_start_angle = math.atan2(iy - self._rotate_center[1], ix - self._rotate_center[0])
+        self._rotate_moved = False
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _apply_rotation(self, position) -> None:
+        """Rotate the box's original corners by the pointer's angular delta."""
+        item = self._rotate_item
+        if item is None or self._rotate_center is None:
+            return
+        cx, cy = self._rotate_center
+        ix, iy = self._image_from_screen(position.x(), position.y())
+        delta = math.atan2(iy - cy, ix - cx) - self._rotate_start_angle
+        cos_d, sin_d = math.cos(delta), math.sin(delta)
+        rotated = []
+        for px, py in self._rotate_origin_points:
+            rx, ry = px - cx, py - cy
+            rotated.append((cx + rx * cos_d - ry * sin_d, cy + rx * sin_d + ry * cos_d))
+        item["points"] = rotated
+        # An axis-aligned bbox item becomes a real rotated quad once turned, so it
+        # must render (and edit) as a polygon from here on.
+        item["shape"] = "polygon"
+        item.setdefault("seg_index", 0)
+        item["center"] = (cx, cy)
+        self._write_rotated_box(item, self._rotate_base_rotation + math.degrees(delta))
+        self._rotate_moved = True
+        self.update()
+
+    @staticmethod
+    def _write_rotated_box(item: dict, rotation_degrees: float) -> None:
+        """Write a rotated box's corners back into its annotation (segmentation/bbox/area/rotation)."""
+        annotation = item.get("annotation")
+        if annotation is None:
+            return
+        points = item["points"]
+        annotation["segmentation"] = [[coord for point in points for coord in point]]
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x, min_y = min(xs), min(ys)
+        annotation["bbox"] = [min_x, min_y, max(xs) - min_x, max(ys) - min_y]
+        annotation["area"] = polygon_area(points)
+        annotation["rotation"] = rotation_degrees % 360.0
+
+    def _finish_rotation(self) -> dict | None:
+        """End a rotate-drag; return a before/after edit record if it actually turned."""
+        item = self._rotate_item
+        annotation = item.get("annotation") if item is not None else None
+        moved = self._rotate_moved
+        before = self._rotate_before
+        self._rotate_item = None
+        self._rotate_center = None
+        self._rotate_origin_points = []
+        self._rotate_before = None
+        self._rotate_moved = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+        if moved and annotation is not None:
+            return {"annotation": annotation, "before": before, "after": self._snapshot_annotation(annotation)}
+        return None
+
+    # ----- moving a whole L2 box ------------------------------------------
+    def _hit_test_box_body(self, position) -> dict | None:
+        """The L2 box whose body is under the cursor in edit mode (boxes only), or None."""
+        if not self._edit_enabled or self._pixmap is None:
+            return None
+        image_x, image_y, _, _ = self._fit_display_rect()
+        target = QPointF(position.x(), position.y())
+        for item in reversed(self._overlay_items):
+            if not item.get("rotatable") or item.get("annotation") is None:
                 continue
             points = item.get("points") or []
-            if points and not visible.intersects(self._points_bounds(points)):
+            if len(points) < 4:
                 continue
-            hover_item = self._hover_vertex is not None and self._hover_vertex[0] is item
-            select_item = self._selected_vertex is not None and self._selected_vertex[0] is item
-            for index, (point_x, point_y) in enumerate(item["points"]):
-                screen_x = image_x + point_x * self._zoom
-                screen_y = image_y + point_y * self._zoom
-                if screen_x < -size or screen_y < -size or screen_x > self.width() + size or screen_y > self.height() + size:
-                    continue
-                hovered = hover_item and self._hover_vertex[1] == index
-                selected = select_item and self._selected_vertex[1] == index
-                if selected:
-                    # The delete target — larger, accent fill, white ring.
-                    radius = size + 3
-                    painter.setPen(QPen(QColor(255, 255, 255), max(1.5, 1.6 * DPI_SCALE)))
-                    painter.setBrush(QColor(255, 92, 92))
-                else:
-                    radius = size + 2 if hovered else size
-                    painter.setPen(QPen(QColor(20, 20, 20), 1))
-                    painter.setBrush(QColor(106, 114, 230) if hovered else QColor(255, 255, 255))
-                painter.drawRect(QRectF(screen_x - radius, screen_y - radius, radius * 2, radius * 2))
+            screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in points]
+            if QPolygonF(screen_points).containsPoint(target, Qt.FillRule.OddEvenFill):
+                return item
+        return None
+
+    def _begin_box_move(self, item: dict, position) -> None:
+        """Select ``item`` and arm a whole-box translate drag (commits past a threshold)."""
+        annotation = item.get("annotation")
+        self._set_selected(annotation)  # also reveals the rotate handle
+        self._box_move_item = item
+        self._box_move_before = self._snapshot_annotation(annotation)
+        self._box_move_origin_points = [(float(x), float(y)) for x, y in item["points"]]
+        center = item.get("center") or polygon_centroid(item["points"])
+        self._box_move_origin_center = (float(center[0]), float(center[1]))
+        self._box_move_start = position.toPoint()
+        self._box_move_start_image = self._image_from_screen(position.x(), position.y())
+        self._box_move_moved = False
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _apply_box_move(self, position) -> None:
+        """Translate the box's original corners by the pointer's image-space delta."""
+        item = self._box_move_item
+        if item is None:
+            return
+        if not self._box_move_moved:
+            if (position.toPoint() - self._box_move_start).manhattanLength() < 4:
+                return  # sub-threshold jitter stays a click (a plain select)
+            self._box_move_moved = True
+        ix, iy = self._image_from_screen(position.x(), position.y())
+        dx = ix - self._box_move_start_image[0]
+        dy = iy - self._box_move_start_image[1]
+        item["points"] = [(px + dx, py + dy) for px, py in self._box_move_origin_points]
+        cx, cy = self._box_move_origin_center
+        item["center"] = (cx + dx, cy + dy)
+        self._write_translated_box(item)
+        self.update()
+
+    @staticmethod
+    def _write_translated_box(item: dict) -> None:
+        """Write a moved box's corners back into its annotation (bbox + quad; area/rotation kept)."""
+        annotation = item.get("annotation")
+        if annotation is None:
+            return
+        points = item["points"]
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x, min_y = min(xs), min(ys)
+        annotation["bbox"] = [min_x, min_y, max(xs) - min_x, max(ys) - min_y]
+        seg = annotation.get("segmentation")
+        if isinstance(seg, list) and seg and isinstance(seg[0], list) and len(seg[0]) >= 8:
+            annotation["segmentation"] = [[coord for point in points for coord in point]]
+
+    def _finish_box_move(self) -> dict | None:
+        """End a whole-box translate; return a before/after edit record if it actually moved."""
+        item = self._box_move_item
+        annotation = item.get("annotation") if item is not None else None
+        moved = self._box_move_moved
+        before = self._box_move_before
+        self._box_move_item = None
+        self._box_move_before = None
+        self._box_move_origin_points = []
+        self._box_move_origin_center = None
+        self._box_move_moved = False
+        self.setCursor(Qt.CursorShape.SizeAllCursor)  # still over the box it just moved
+        self.update()
+        if moved and annotation is not None:
+            return {"annotation": annotation, "before": before, "after": self._snapshot_annotation(annotation)}
+        return None
+
+    @staticmethod
+    def _arc_xy(cx: float, cy: float, r: float, deg: float) -> tuple[float, float]:
+        """Point on a QPainter arc (0° at 3 o'clock, CCW positive, y-down screen)."""
+        rad = math.radians(deg)
+        return cx + r * math.cos(rad), cy - r * math.sin(rad)
+
+    def _draw_rotation_handle(self, painter: QPainter, image_x: int, image_y: int) -> None:
+        """Draw the circular rotate handle next to the selected L2 box."""
+        item = self._rotation_target()
+        if item is None:
+            return
+        handle = self._rotation_handle_image_pos(item)
+        if handle is None:
+            return
+        (hx, hy), (mx, my) = handle
+        sx = image_x + hx * self._zoom
+        sy = image_y + hy * self._zoom
+        emx = image_x + mx * self._zoom
+        emy = image_y + my * self._zoom
+        # Connector from the box edge to the handle.
+        painter.setPen(QPen(QColor(255, 255, 255, 150), max(1.0, 1.2 * DPI_SCALE)))
+        painter.drawLine(QPointF(emx, emy), QPointF(sx, sy))
+        # Handle disc: white fill, accent ring (slightly larger when hovered).
+        radius = self._handle_hit_radius + (2 if (self._rotation_hover or self._rotate_item is item) else 0)
+        painter.setPen(QPen(QColor(106, 114, 230), max(1.6, 1.8 * DPI_SCALE)))
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawEllipse(QPointF(sx, sy), radius, radius)
+        # Rotate glyph: an open arc with an arrowhead, drawn dark on the white disc.
+        r = radius * 0.5
+        pen = QPen(QColor(28, 28, 30), max(1.5, 1.7 * DPI_SCALE))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        start_deg, span_deg = 125.0, -290.0
+        painter.drawArc(QRectF(sx - r, sy - r, 2 * r, 2 * r), int(round(start_deg * 16)), int(round(span_deg * 16)))
+        end_deg = start_deg + span_deg
+        tip = self._arc_xy(sx, sy, r, end_deg)
+        prev = self._arc_xy(sx, sy, r, end_deg + 6.0)  # span<0, so +deg is back along the sweep
+        tx, ty = tip[0] - prev[0], tip[1] - prev[1]
+        length = math.hypot(tx, ty) or 1.0
+        ux, uy = tx / length, ty / length      # unit tangent (sweep direction)
+        nx, ny = -uy, ux                        # unit normal
+        head = max(3.0, r * 0.9)
+        half = max(2.0, r * 0.55)
+        base_x, base_y = tip[0] - ux * head, tip[1] - uy * head
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(28, 28, 30))
+        painter.drawPolygon(QPolygonF([
+            QPointF(tip[0], tip[1]),
+            QPointF(base_x + nx * half, base_y + ny * half),
+            QPointF(base_x - nx * half, base_y - ny * half),
+        ]))
+
+    def _draw_handles(self, painter: QPainter, image_x: int, image_y: int) -> None:
+        """Draw grab handles for the SELECTED object's vertices only (like the rotate handle)."""
+        if not self._edit_enabled:
+            return
+        item = self._selected_overlay_item()
+        if item is None or not item.get("editable"):
+            return
+        size = self._handle_size
+        hover_item = self._hover_vertex is not None and self._hover_vertex[0] is item
+        select_item = self._selected_vertex is not None and self._selected_vertex[0] is item
+        for index, (point_x, point_y) in enumerate(item["points"]):
+            screen_x = image_x + point_x * self._zoom
+            screen_y = image_y + point_y * self._zoom
+            if screen_x < -size or screen_y < -size or screen_x > self.width() + size or screen_y > self.height() + size:
+                continue
+            hovered = hover_item and self._hover_vertex[1] == index
+            selected = select_item and self._selected_vertex[1] == index
+            if selected:
+                # The delete target — larger, accent fill, white ring.
+                radius = size + 3
+                painter.setPen(QPen(QColor(255, 255, 255), max(1.5, 1.6 * DPI_SCALE)))
+                painter.setBrush(QColor(255, 92, 92))
+            else:
+                radius = size + 2 if hovered else size
+                painter.setPen(QPen(QColor(20, 20, 20), 1))
+                painter.setBrush(QColor(106, 114, 230) if hovered else QColor(255, 255, 255))
+            painter.drawRect(QRectF(screen_x - radius, screen_y - radius, radius * 2, radius * 2))
 
     def _draw_pending(self, painter: QPainter, image_x: int, image_y: int) -> None:
         """Render the in-progress drawn shape (rubber band) on top of everything."""
@@ -1111,6 +1402,12 @@ class ImageCanvas(QWidget):
                 return
 
         if event.button() == Qt.MouseButton.LeftButton:
+            # The rotate handle of a selected L2 box wins over everything else.
+            rotate_item = self._hit_test_rotation_handle(event.position())
+            if rotate_item is not None:
+                self._begin_rotation(rotate_item, event.position())
+                return
+
             # Drawing takes precedence over panning/editing when armed.
             if self._draw_shape is not None and self._pixmap is not None:
                 # Drawing points are pinned to the image so nothing lands off-picture.
@@ -1149,6 +1446,11 @@ class ImageCanvas(QWidget):
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 self.update()
                 return
+            # Not on a corner: dragging an L2 box body (edit mode) moves it whole.
+            box_body = self._hit_test_box_body(event.position())
+            if box_body is not None:
+                self._begin_box_move(box_body, event.position())
+                return
             # Not on a vertex: any other left-click drops the vertex selection.
             self._selected_vertex = None
             # Clicking an annotation body selects it; a parked redefine overlay is
@@ -1174,6 +1476,14 @@ class ImageCanvas(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._rotate_item is not None:
+            self._apply_rotation(event.position())
+            return
+
+        if self._box_move_item is not None:
+            self._apply_box_move(event.position())
+            return
+
         if self._drag_pending_index is not None:
             current = event.position().toPoint()
             if not self._pending_moved and (current - self._drag_start).manhattanLength() < 4:
@@ -1244,6 +1554,20 @@ class ImageCanvas(QWidget):
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
+            # Settle a rotate-drag of a selected L2 box (emit a before/after record).
+            if self._rotate_item is not None:
+                record = self._finish_rotation()
+                if record is not None:
+                    self.annotationsChanged.emit(record)
+                return
+
+            # Settle a whole-box move (emit a before/after record if it actually moved).
+            if self._box_move_item is not None:
+                record = self._finish_box_move()
+                if record is not None:
+                    self.annotationsChanged.emit(record)
+                return
+
             # Settling a grabbed in-progress polygon point: a drag finalises the move;
             # a click (no drag) closes on the first point, else selects it for delete.
             if self._drag_pending_index is not None:
@@ -1286,24 +1610,43 @@ class ImageCanvas(QWidget):
 
     @staticmethod
     def _snapshot_annotation(annotation: dict | None) -> dict | None:
-        """Deep-copy the geometry fields that a vertex edit can change, for undo/redo."""
+        """Deep-copy the geometry fields that a vertex/rotation edit can change, for undo/redo."""
         if annotation is None:
             return None
-        return {
+        snapshot = {
             "bbox": copy.deepcopy(annotation.get("bbox")),
             "area": annotation.get("area"),
             "segmentation": copy.deepcopy(annotation.get("segmentation")),
         }
+        # Only L2 boxes carry rotation; keep it out of polygon snapshots so undo
+        # never writes a stray rotation key onto an L1/L3 annotation.
+        if "rotation" in annotation:
+            snapshot["rotation"] = annotation.get("rotation")
+        return snapshot
 
     def _update_hover(self, position) -> None:
         """Highlight the handle under the cursor and switch the cursor shape."""
+        # The rotate handle (when a rotatable L2 box is selected) takes hover first.
+        over_rotation = self._hit_test_rotation_handle(position) is not None
+        if over_rotation != self._rotation_hover:
+            self._rotation_hover = over_rotation
+            self.update()
+        if over_rotation:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+
         hit = self._hit_test_vertex(position)
         new_key = (id(hit[0]), hit[1]) if hit is not None else None
         old_key = (id(self._hover_vertex[0]), self._hover_vertex[1]) if self._hover_vertex is not None else None
         if new_key != old_key:
             self._hover_vertex = hit
-            self.setCursor(Qt.CursorShape.OpenHandCursor if hit else Qt.CursorShape.ArrowCursor)
             self.update()
+        if hit is not None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)  # a draggable corner
+        elif self._hit_test_box_body(position) is not None:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)   # a movable L2 box body
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -1654,7 +1997,9 @@ class ShortcutsDialog(QDialog):
         for desc, action in (
             ("Wheel", "zoom"),
             ("Drag empty space", "pan"),
-            ("Drag a handle", "move a box corner / polygon vertex"),
+            ("Click an object (Edit)", "select it — only the selected object shows handles"),
+            ("Drag a handle (Edit)", "move a box corner / polygon vertex of the selected object"),
+            ("Drag an L2 box body (Edit)", "move the whole box; its round handle rotates it"),
             ("Click a vertex (Edit)", "select it; Delete/Backspace removes it (polygons only)"),
             ("Right-click (Edit)", "add a polygon vertex on the nearest edge"),
             ("Drag a point while drawing", "move it; click an existing point to select, Delete removes"),
@@ -4372,8 +4717,10 @@ class PyQtAnnotationReview(QMainWindow):
             "• Annotate — draw new objects with the Draw tool (D). Both modes share the\n"
             "  same per-level data and save the same level files.\n\n"
             "EDITING\n"
-            "• Edit objects (T): drag a corner/vertex to move it. On polygons, click a\n"
-            "  vertex then Delete to remove it, or right-click an edge to add one.\n"
+            "• Edit objects (T): select an object first — only the SELECTED object shows\n"
+            "  its handles. Drag a corner/vertex to move it. On polygons, click a vertex\n"
+            "  then Delete to remove it, or right-click an edge to add one. Drag an L2 box\n"
+            "  body to move it whole, or its round handle to rotate it.\n"
             "• While drawing: click to place points, drag a point to move it, right-click\n"
             "  to insert, Enter/double-click to finish, Esc to cancel.\n"
             "• Select an object to change its class (sidebar catalog) or delete it (Del).\n"
@@ -4426,6 +4773,7 @@ class PyQtAnnotationReview(QMainWindow):
                 overlay_items.append({
                     "shape": "bbox", "points": points, "center": (x + width / 2.0, y + height / 2.0),
                     "label": label, "color": color_rgb, "annotation": annotation, "editable": True,
+                    "rotatable": True,  # axis-aligned L2 box — the rotate handle turns it
                 })
                 continue
 
@@ -4440,6 +4788,8 @@ class PyQtAnnotationReview(QMainWindow):
                 # Add/remove vertices only on TRUE polygons (L1/L3). An oriented L2
                 # box also renders as a 4-point polygon but must stay a quad.
                 "vertex_editable": geometry == levels.GEOMETRY_POLYGON,
+                # The rotate handle is offered for L2 boxes (oriented quads) only.
+                "rotatable": geometry == levels.GEOMETRY_ROTATED_BBOX,
             })
         return overlay_items
 
@@ -4802,6 +5152,8 @@ class PyQtAnnotationReview(QMainWindow):
         annotation["bbox"] = copy.deepcopy(snapshot.get("bbox"))
         annotation["area"] = snapshot.get("area")
         annotation["segmentation"] = copy.deepcopy(snapshot.get("segmentation"))
+        if "rotation" in snapshot:
+            annotation["rotation"] = snapshot.get("rotation")
 
         target_index = record.get("image_index", self.index)
         if self.images and 0 <= target_index < len(self.images) and target_index != self.index:
