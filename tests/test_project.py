@@ -277,6 +277,22 @@ def test_export_zip_round_trips() -> None:
         assert reopened.read_level(1).get("scene_000000001.png")
 
 
+def test_applog_prune_keeps_most_recent() -> None:
+    import os as _os
+
+    from src import applog
+
+    with tempfile.TemporaryDirectory() as parent:
+        directory = Path(parent)
+        for i in range(5):
+            path = directory / f"session_{i}.log"
+            path.write_text("x", encoding="utf-8")
+            _os.utime(path, (i, i))  # ascending mtime -> i=4 is newest
+        applog._prune(directory, keep=3)
+        remaining = sorted(p.name for p in directory.glob("session_*.log"))
+        assert remaining == ["session_2.log", "session_3.log", "session_4.log"]
+
+
 def _run_all() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0

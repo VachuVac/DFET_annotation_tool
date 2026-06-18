@@ -18,6 +18,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QImage
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -489,6 +490,255 @@ def test_image_selector_items_are_numbered() -> None:
         assert texts[0].startswith("1/2") and texts[1].startswith("2/2")
         joined = " ".join(texts)
         assert "scene_000000001.png" in joined and "scene_000000002.png" in joined
+
+
+def test_vertex_editable_flag_is_polygon_only() -> None:
+    # Add/remove vertices is allowed on TRUE polygons (L1/L3) only; an axis box and
+    # an oriented (rotated) L2 box must keep their 4-corner shape.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        assert window._build_annotation_overlay_items([poly], 1)[0]["vertex_editable"] is True
+        assert window._build_annotation_overlay_items([poly], 3)[0]["vertex_editable"] is True
+
+        box = {"category_id": 1, "bbox": [0, 0, 10, 10], "area": 100, "rotation": 0}
+        item_box = window._build_annotation_overlay_items([box], 2)[0]
+        assert item_box["shape"] == "bbox" and item_box.get("vertex_editable") is not True
+
+        obox = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100, "rotation": 30}
+        item_obox = window._build_annotation_overlay_items([obox], 2)[0]
+        assert item_obox["shape"] == "polygon" and item_obox.get("vertex_editable") is not True
+
+
+def test_delete_selected_vertex_guard_and_undo() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+        ann = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 5, 15, 0, 10]], "bbox": [0, 0, 10, 15], "area": 1}
+        window.annotation_store[1].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        window.canvas.set_edit_enabled(True)
+
+        item = next(it for it in window.canvas._overlay_items if it.get("annotation") is ann)
+        window.canvas._selected_vertex = (item, 3)
+        assert window.canvas.delete_selected_vertex() is True
+        assert len(ann["segmentation"][0]) == 8  # 5 points -> 4
+
+        window._undo()  # restores the removed vertex
+        assert len(ann["segmentation"][0]) == 10
+
+        # A triangle refuses further removal (polygon needs >=3 points).
+        tri = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 5, 10]], "bbox": [0, 0, 10, 10], "area": 1}
+        window.annotation_store[1][basename] = [tri]
+        window._refresh_overlay_items()
+        tri_item = next(it for it in window.canvas._overlay_items if it.get("annotation") is tri)
+        window.canvas._selected_vertex = (tri_item, 0)
+        assert window.canvas.delete_selected_vertex() is False
+        assert len(tri["segmentation"][0]) == 6
+
+
+def test_insert_vertex_on_nearest_edge() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+        ann = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        window.canvas.set_edit_enabled(True)
+        assert window.canvas.has_image  # _fit_display_rect needs a loaded pixmap
+
+        # Screen point at the midpoint of the top edge (image (5, 0)).
+        ix, iy, _w, _h = window.canvas._fit_display_rect()
+        z = window.canvas._zoom
+        pos = QPointF(ix + 5 * z, iy + 0 * z)
+        assert window.canvas.insert_vertex_at(pos) is True
+        assert len(ann["segmentation"][0]) == 10  # 4 points -> 5
+        # The new vertex sits on the top edge (y ~ 0) and is selected.
+        assert window.canvas._selected_vertex is not None
+        window._undo()
+        assert len(ann["segmentation"][0]) == 8
+
+
+class _FakeMouse:
+    """Minimal stand-in for QMouseEvent for headless press/move/release tests."""
+
+    def __init__(self, x: float, y: float, button) -> None:
+        self._p = QPointF(x, y)
+        self._b = button
+
+    def button(self):
+        return self._b
+
+    def buttons(self):
+        return self._b
+
+    def position(self):
+        return self._p
+
+    def modifiers(self):
+        return Qt.KeyboardModifier.NoModifier
+
+
+def test_pending_polygon_point_move_select_delete_insert() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        canvas = window.canvas
+        assert canvas.has_image
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas.set_draw_shape("polygon", (255, 255, 255))
+        canvas._poly_points = [(0.0, 0.0), (3.0, 0.0), (3.0, 3.0), (0.0, 3.0)]
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+
+        def screen(px, py):
+            return ix + px * z, iy + py * z
+
+        # Hit-test finds the point at image (3, 0).
+        sx, sy = screen(3, 0)
+        assert canvas._hit_test_pending_vertex(QPointF(sx, sy)) == 1
+
+        # Full grab→drag→release moves that point (the reported "can't move" case).
+        canvas.mousePressEvent(_FakeMouse(sx, sy, Qt.MouseButton.LeftButton))
+        assert canvas._drag_pending_index == 1
+        tx, ty = screen(2, 2)
+        canvas.mouseMoveEvent(_FakeMouse(tx, ty, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(tx, ty, Qt.MouseButton.LeftButton))
+        assert canvas._drag_pending_index is None
+        assert canvas._poly_points[1] != (3.0, 0.0)  # it moved
+        assert len(canvas._poly_points) == 4  # a move never adds/removes points
+
+        # Right-click inserts on the nearest edge (between points 2 and 3).
+        mx, my = screen(1.5, 3)
+        assert canvas._insert_pending_vertex_at(QPointF(mx, my)) is True
+        assert len(canvas._poly_points) == 5
+        assert canvas._selected_pending_index is not None
+
+        # Delete removes the selected pending point.
+        assert canvas.delete_selected_pending_vertex() is True
+        assert len(canvas._poly_points) == 4
+
+
+def test_reclassify_selected_object_is_undoable() -> None:
+    from src import levels
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(3)  # L3 polygons with several classes
+        names = [entry[0] for entry in levels.level_classes(3)]  # (name, hex) -> name
+        class_a, class_b = names[0], names[1]
+        cat_a = levels.category_id_for_class(3, class_a)
+        cat_b = levels.category_id_for_class(3, class_b)
+        ann = {"category_id": cat_a, "segmentation": [[0, 0, 6, 0, 6, 6, 0, 6]], "bbox": [0, 0, 6, 6], "area": 36}
+        window.annotation_store[3].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+
+        # Selecting the object swaps the sidebar to the change-class catalog.
+        window.canvas._set_selected(ann)
+        assert window._redefine_panel_active is True
+
+        # Reclassify to class B; the object STAYS selected (panel stays up).
+        window._reclassify_selected(ann, class_b)
+        assert ann["category_id"] == cat_b
+        assert window.canvas.selected_annotation() is ann
+        assert window._redefine_panel_active is True
+
+        # undo/redo swaps the category back and forth.
+        window._undo()
+        assert ann["category_id"] == cat_a
+        window._redo()
+        assert ann["category_id"] == cat_b
+
+        # Esc deselects (and restores the normal class list).
+        assert window._handle_escape() is True
+        assert window.canvas.selected_annotation() is None
+        assert window._redefine_panel_active is False
+
+
+def test_escape_exits_draw_and_edit_modes() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+
+        window.draw_button.setChecked(True)
+        assert window._handle_escape() is True
+        assert window.draw_button.isChecked() is False  # draw mode turned off + unhighlighted
+
+        window.edit_objects_button.setChecked(True)
+        assert window._handle_escape() is True
+        assert window.edit_objects_button.isChecked() is False  # edit mode turned off
+
+        assert window._handle_escape() is False  # nothing active -> no-op (never quits)
+
+
+def test_class_list_popout_and_dock() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        container = window.class_list_container
+
+        # Pop out: the SAME container moves into the separate window.
+        window._toggle_class_popout()
+        assert window.class_popout is not None
+        assert window.class_popout.scroll.widget() is container
+        assert window.class_scroll.widget() is None
+        assert window.class_scroll.isHidden()
+
+        # Toggle again -> closes the window -> container docks back into the sidebar.
+        window._toggle_class_popout()
+        assert window.class_popout is None
+        assert window.class_scroll.widget() is container
+        assert not window.class_scroll.isHidden()
+
+
+def test_canvas_popout_and_dock() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        container = window.canvas_container
+
+        # Pop out: the SAME canvas container moves into the separate window; the
+        # placeholder hint takes its spot in the main view.
+        window._toggle_canvas_popout()
+        assert window.canvas_popout is not None
+        assert container.parent() is window.canvas_popout
+        assert window.main_layout.indexOf(container) == -1
+        assert not window.canvas_popout_hint.isHidden()
+        # The canvas widget rode along and still belongs to the same container.
+        assert window.canvas.parent() is container
+
+        # Toggle again -> closes the window -> the canvas docks back into the main
+        # view at the left (index 0, before the hint and sidebar).
+        window._toggle_canvas_popout()
+        assert window.canvas_popout is None
+        assert window.main_layout.indexOf(container) == 0
+        assert window.canvas_popout_hint.isHidden()
+
+
+def test_canvas_docks_back_when_project_closes() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        container = window.canvas_container
+        window._toggle_canvas_popout()
+        assert window.canvas_popout is not None
+
+        # Returning to the welcome screen (no project) must reclaim the canvas.
+        window.project = None
+        window._update_project_chrome()
+        assert window.canvas_popout is None
+        assert window.main_layout.indexOf(container) == 0
 
 
 def test_convert_coerces_polygon_to_box_for_box_level() -> None:
