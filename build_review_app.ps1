@@ -25,11 +25,11 @@ if (Test-Path "review_app.spec") {
     & $envPython -m PyInstaller --noconfirm --clean "review_app.spec"
 } else {
     Write-Host "Spec file not found. Building with default options from review.py"
-    & $envPython -m PyInstaller --noconfirm --clean --name "review_app" "review.py"
+    & $envPython -m PyInstaller --noconfirm --clean --name "Annotation Workbench" --icon "src/assets/app_icon.ico" "review.py"
 }
 
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed."
 }
 
-Write-Host "Build complete. EXE should be in dist\review_app\"
+Write-Host "Build complete. EXE should be in 'dist\Annotation Workbench\'"

@@ -851,6 +851,66 @@ def test_rotate_selected_l2_box_drag_and_undo() -> None:
         assert ann.get("segmentation") is None
 
 
+def test_rotated_box_vertex_drag_stays_rectangular() -> None:
+    import math
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(2)
+        canvas = window.canvas
+
+        # A box rotated 30° about its centre (2, 2) — kept inside the 4x4 test
+        # image so the drag target isn't clamped. Stored as a 4-corner quad.
+        cx, cy = 2.0, 2.0
+        theta = math.radians(30)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+
+        def rot(px, py):
+            dx, dy = px - cx, py - cy
+            return (cx + dx * cos_t - dy * sin_t, cy + dx * sin_t + dy * cos_t)
+
+        quad = [rot(1, 1), rot(3, 1), rot(3, 3), rot(1, 3)]
+        seg = [c for p in quad for c in p]
+        ann = {"category_id": 1, "segmentation": [seg], "bbox": [1, 1, 2, 2],
+               "area": 4, "rotation": 30.0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        canvas.set_edit_enabled(True)
+        canvas._set_selected(ann)
+
+        item = canvas._selected_overlay_item()
+        assert item is not None and item["shape"] == "polygon" and item["rotatable"]
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # Grab corner 0 and drag it well off its rectangular position; a polygon
+        # would warp, a box must stay rectangular.
+        p0x, p0y = quad[0]
+        canvas.mousePressEvent(_FakeMouse(ix + p0x * z, iy + p0y * z, Qt.MouseButton.LeftButton))
+        assert canvas._drag_vertex is not None and canvas._drag_vertex[1] == 0
+        tx, ty = p0x - 0.5, p0y - 0.3
+        canvas.mouseMoveEvent(_FakeMouse(ix + tx * z, iy + ty * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + tx * z, iy + ty * z, Qt.MouseButton.LeftButton))
+
+        pts = item["points"]
+        # The opposite corner (index 2) is pinned.
+        assert abs(pts[2][0] - quad[2][0]) < 1e-6 and abs(pts[2][1] - quad[2][1]) < 1e-6
+        # The dragged corner landed exactly where the cursor was.
+        assert abs(pts[0][0] - tx) < 1e-6 and abs(pts[0][1] - ty) < 1e-6
+        # It is still a true rectangle: right angle at corner 1, equal opposite sides.
+        e01 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+        e12 = (pts[2][0] - pts[1][0], pts[2][1] - pts[1][1])
+        assert abs(e01[0] * e12[0] + e01[1] * e12[1]) < 1e-4   # perpendicular edges
+        e32 = (pts[2][0] - pts[3][0], pts[2][1] - pts[3][1])
+        assert abs(e01[0] - e32[0]) < 1e-4 and abs(e01[1] - e32[1]) < 1e-4  # parallel & equal
+        # Orientation is preserved (edge 0->1 keeps the 30° box axis direction).
+        ang = math.degrees(math.atan2(e01[1], e01[0])) % 180
+        assert abs(ang - 30.0) < 1e-3
+        assert abs(ann["rotation"] - 30.0) < 1e-6  # rotation unchanged by a resize
+
+
 def test_move_whole_l2_box_drag_and_undo() -> None:
     window = _window()
     with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
@@ -1288,6 +1348,53 @@ def test_redefine_object_selectable_and_reclassified_per_object() -> None:
         assert project.unmapped_class_counts() == {"banana": 1}  # the other stays parked
         assert len(window._pending_redefine_overlays(1)) == 1
         assert window._redefine_panel_active is False  # normal sidebar restored
+
+
+def test_redefine_overlay_matches_image_by_stable_id_across_prefix() -> None:
+    # Regression: a real export references the SAME photo under a different filename
+    # prefix than the project's stored copy. The red row flag matched by stable id,
+    # but the redefine overlay matched by exact basename -> the row went red yet no
+    # overlay appeared, and resolving stored the object under the wrong key (it
+    # "vanished"). Both must match by stable id.
+    from src.data_loading import stable_image_id
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _project_with_image(window, parent, src)  # scene_000000001.png
+        alt_name = "batch07-uuidA-000000001.png"  # same last-9 stem => same stable id
+        assert stable_image_id(alt_name) == stable_image_id(basename)
+
+        images = [{"id": 1, "file_name": alt_name}]
+        ann = {"category_id": 9, "segmentation": [[0, 0, 3, 0, 3, 3, 0, 3]], "bbox": [0, 0, 3, 3], "area": 9}
+        window._route_and_commit_annotations(images, {1: [ann]}, {9: "banana"})  # off-catalog -> stashed
+        assert project.unmapped_class_counts() == {"banana": 1}
+
+        window._set_mode("annotation")
+        window._set_level(1)
+        # The redefine overlay appears on the project's image despite the prefix.
+        overlays = [o for o in window.current_overlay_items if o.get("pending_redefine")]
+        assert len(overlays) == 1
+
+        # Resolving lands the object under the PROJECT's basename, so it stays visible.
+        window.canvas._set_selected_redefine(overlays[0])
+        window._resolve_redefine_object(overlays[0].get("redefine_entry_id"), "road_asphalt")
+        store = project.read_level(1)
+        assert basename in store and len(store[basename]) == 1
+        assert project.unmapped_class_counts() == {}
+        assert any(not o.get("pending_redefine") for o in window.current_overlay_items)
+
+
+def test_image_id_badge_shows_current_image_id() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)  # scene_000000001.png
+        window._update_status_labels()
+        expected = os.path.splitext(basename)[0][-9:]  # the Copy ID value
+        assert window.image_id_label.text() == expected
+        assert window._current_image_id_text() == expected
+        # The badge mirrors exactly what Copy ID writes to the clipboard.
+        window._copy_image_id()
+        assert QApplication.clipboard().text() == expected
 
 
 def _run_all() -> int:

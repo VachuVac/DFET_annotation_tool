@@ -31,7 +31,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='review_app',
+    name='Annotation Workbench',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

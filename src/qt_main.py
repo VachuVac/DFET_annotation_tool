@@ -750,6 +750,11 @@ class ImageCanvas(QWidget):
             if annotation is not None:
                 annotation["bbox"] = [new_x, new_y, width, height]
                 annotation["area"] = width * height
+        elif item.get("rotatable"):
+            # A rotated L2 box renders as a polygon, but dragging a corner must
+            # still resize it as a *rectangle* about its (rotated) axes — never
+            # warp it into an arbitrary quad like a real polygon.
+            self._apply_box_vertex_drag(item, index, image_x, image_y)
         else:
             points = item["points"]
             if 0 <= index < len(points):
@@ -757,6 +762,54 @@ class ImageCanvas(QWidget):
                 item["center"] = polygon_centroid(points)
             if annotation is not None:
                 self._write_polygon_vertex(annotation, int(item.get("seg_index", 0)), index, image_x, image_y)
+
+    def _apply_box_vertex_drag(self, item: dict, index: int, image_x: float, image_y: float) -> None:
+        """Resize a rotated box by dragging one corner, pinning the opposite one.
+
+        The box keeps its orientation and stays a true rectangle: the dragged
+        corner and the fixed (diagonal) corner define the new rectangle in the
+        box's own rotated frame; the two adjacent corners follow.
+        """
+        points = item["points"]
+        if len(points) != 4 or not (0 <= index < 4):
+            return
+        annotation = item.get("annotation")
+        fixed = points[(index + 2) % 4]
+        fx, fy = float(fixed[0]), float(fixed[1])
+
+        # Box-local x-axis: along the first edge (P0->P1); fall back to the stored
+        # rotation when that edge has collapsed to ~zero length.
+        ax = points[1][0] - points[0][0]
+        ay = points[1][1] - points[0][1]
+        length = math.hypot(ax, ay)
+        if length > 1e-6:
+            ux, uy = ax / length, ay / length
+        else:
+            theta = math.radians(float(annotation.get("rotation", 0) or 0)) if annotation else 0.0
+            ux, uy = math.cos(theta), math.sin(theta)
+        vx, vy = -uy, ux  # perpendicular (box-local y-axis)
+
+        # New dragged corner in the box frame, measured from the fixed corner.
+        ddx, ddy = image_x - fx, image_y - fy
+        new_u = ddx * ux + ddy * uy
+        new_v = ddx * vx + ddy * vy
+
+        new_points: list[tuple[float, float]] = [(0.0, 0.0)] * 4
+        for j in range(4):
+            rel_x, rel_y = points[j][0] - fx, points[j][1] - fy
+            # Each corner shares either the fixed corner's coordinate (0) or the
+            # dragged corner's (full span) along each box axis.
+            share_u = abs(rel_x * ux + rel_y * uy) > 1e-6
+            share_v = abs(rel_x * vx + rel_y * vy) > 1e-6
+            cu = new_u if share_u else 0.0
+            cv = new_v if share_v else 0.0
+            new_points[j] = (fx + cu * ux + cv * vx, fy + cu * uy + cv * vy)
+
+        item["points"] = new_points
+        item["center"] = ((new_points[0][0] + new_points[2][0]) / 2.0,
+                          (new_points[0][1] + new_points[2][1]) / 2.0)
+        if annotation is not None:
+            self._write_rotated_box(item, float(annotation.get("rotation", 0) or 0))
 
     @staticmethod
     def _write_polygon_vertex(annotation: dict, seg_index: int, point_index: int, x: float, y: float) -> None:
@@ -2420,15 +2473,23 @@ class ClassListWindow(QDialog):
     closed = pyqtSignal()
 
     def __init__(self, owner: QWidget) -> None:
-        super().__init__(owner)
+        # No Qt parent: an *owned* dialog shares the main window's taskbar button
+        # and can't be alt+tab'd independently. As a parentless top-level
+        # ``Qt.Window`` it gets its own taskbar entry and tabs like a real app
+        # window (e.g. onto a second monitor).
+        super().__init__(None)
+        self._owner = owner
         self.setWindowTitle("Class list")
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        # Give the title bar real min/max buttons (QDialog has none by default).
+        self.setWindowIcon(owner.windowIcon())
+        # A standard top-level window: own taskbar button + real min/max/close.
         self.setWindowFlags(
-            self.windowFlags()
+            Qt.WindowType.Window
             | Qt.WindowType.WindowMinimizeButtonHint
             | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowSystemMenuHint
         )
         self.resize(max(320, int(round(360 * DPI_SCALE))), max(480, int(round(640 * DPI_SCALE))))
         layout = QVBoxLayout(self)
@@ -2457,16 +2518,21 @@ class CanvasWindow(QDialog):
     closed = pyqtSignal()
 
     def __init__(self, owner: QWidget) -> None:
-        super().__init__(owner)
+        # Parentless top-level window (see ClassListWindow): own taskbar button,
+        # independently alt+tab-able onto a second monitor.
+        super().__init__(None)
         self._owner = owner
         self.setWindowTitle("Image view")
         self.setModal(False)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        # Give the title bar real min/max buttons (QDialog has none by default).
+        self.setWindowIcon(owner.windowIcon())
+        # A standard top-level window: own taskbar button + real min/max/close.
         self.setWindowFlags(
-            self.windowFlags()
+            Qt.WindowType.Window
             | Qt.WindowType.WindowMinimizeButtonHint
             | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowSystemMenuHint
         )
         self.resize(max(640, int(round(900 * DPI_SCALE))), max(480, int(round(680 * DPI_SCALE))))
         layout = QVBoxLayout(self)
@@ -2719,9 +2785,21 @@ class PyQtAnnotationReview(QMainWindow):
         sidebar_layout.setSpacing(12)
         main_layout.addWidget(self.sidebar)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
         header = QLabel("Annotation Workbench")
         header.setObjectName("header")
-        sidebar_layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        # The current image's id (last 9 chars of the filename — the Copy ID value),
+        # shown beside the title so the annotator always sees which image they're on.
+        self.image_id_label = QLabel("")
+        self.image_id_label.setObjectName("imageIdBadge")
+        self.image_id_label.setToolTip("Current image id — the last 9 characters copied by Copy ID")
+        self.image_id_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header_row.addWidget(self.image_id_label)
+        sidebar_layout.addLayout(header_row)
 
         subtitle = QLabel("COCO box & polygon editor")
         subtitle.setObjectName("muted")
@@ -3763,7 +3841,6 @@ class PyQtAnnotationReview(QMainWindow):
         if not pending:
             return {"promoted": 0, "remaining": 0}
 
-        present = set(self.project.basename_to_id().keys())
         additions: dict[int, dict[str, list]] = {}
         orphan_entries: list[dict] = []
         remaining: list[dict] = []
@@ -3779,14 +3856,20 @@ class PyQtAnnotationReview(QMainWindow):
             if converted is None:
                 remaining.append(entry)  # geometry-less: keep stashed rather than lose it
                 continue
+            # Resolve the image by stable id (robust to re-export prefixes), so a
+            # present image is recognised even when its filename differs, and the
+            # annotation is stored under the project's own basename.
             basename = os.path.basename(str(entry.get("file_name", "")))
-            if basename in present:
-                additions.setdefault(remap["level"], {}).setdefault(basename, []).append(converted)
+            sid = int(entry.get("stable_image_id", stable_image_id(basename)))
+            record = self.project.image_record(sid)
+            if record is not None:
+                canonical = os.path.basename(str(record["file_name"]))
+                additions.setdefault(remap["level"], {}).setdefault(canonical, []).append(converted)
             else:
                 orphan_entries.append(
                     {
                         "level": remap["level"],
-                        "stable_image_id": int(entry.get("stable_image_id", stable_image_id(basename))),
+                        "stable_image_id": sid,
                         "file_name": basename,
                         "annotation": converted,
                     }
@@ -3906,6 +3989,16 @@ class PyQtAnnotationReview(QMainWindow):
             }}
             QLabel#muted {{
                 color: #c2c6ce;
+            }}
+            QLabel#imageIdBadge {{
+                color: #d6e2ff;
+                background: #2a3340;
+                border: 1px solid #3a4656;
+                border-radius: 6px;
+                padding: 2px 8px;
+                font-family: "Consolas", "Courier New", monospace;
+                font-weight: 700;
+                font-size: {max(8, int(round(9 * DPI_SCALE)))}pt;
             }}
             QWidget#welcomePage {{
                 background: #111315;
@@ -4240,17 +4333,19 @@ class PyQtAnnotationReview(QMainWindow):
         except OSError:
             pass
 
+    def _current_image_id_text(self) -> str:
+        """The current image's id: last 9 chars of the filename stem (Copy ID value)."""
+        if not self.current_image_name:
+            return ""
+        stem = os.path.splitext(os.path.basename(self.current_image_name))[0]
+        return stem[-9:] if len(stem) >= 9 else stem
+
     def _copy_image_id(self) -> None:
         """Copy the last 9 characters of the image filename (without extension) to clipboard."""
-        if not self.current_image_name:
+        image_id = self._current_image_id_text()
+        if not image_id:
             return
-        
-        basename = os.path.basename(self.current_image_name)
-        # Remove file extension
-        name_without_ext = os.path.splitext(basename)[0]
-        # Get last 9 characters
-        image_id = name_without_ext[-9:] if len(name_without_ext) >= 9 else name_without_ext
-        
+
         # Copy to clipboard
         clipboard = QApplication.clipboard()
         clipboard.setText(image_id)
@@ -4982,6 +5077,32 @@ class PyQtAnnotationReview(QMainWindow):
             return [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
         return []
 
+    @staticmethod
+    def _entry_image_id(entry: dict) -> int | None:
+        """Stable image id for a stashed entry (its own id, else hashed from name)."""
+        sid = entry.get("stable_image_id")
+        if sid is not None:
+            try:
+                return int(sid)
+            except (TypeError, ValueError):
+                pass
+        name = os.path.basename(str(entry.get("file_name", "")))
+        return stable_image_id(name) if name else None
+
+    def _current_stable_image_id(self) -> int | None:
+        """Stable image id of the image on screen (the registry id, robust to prefixes)."""
+        if not self.images or not (0 <= self.index < len(self.images)):
+            return None
+        record = self.images[self.index]
+        sid = record.get("id") if isinstance(record, dict) else None
+        if sid is None:
+            basename = self._current_image_basename()
+            sid = stable_image_id(basename) if basename else None
+        try:
+            return int(sid) if sid is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def _pending_redefine_overlays(self, level: int) -> list[dict]:
         """Highlighted, read-only overlays for unredefined classes shown on ``level``.
 
@@ -4991,12 +5112,16 @@ class PyQtAnnotationReview(QMainWindow):
         """
         if self.project is None:
             return []
-        basename = self._current_image_basename()
-        if not basename:
+        if not self._current_image_basename():
             return []
+        # Match by stable_image_id, NOT exact filename: a re-exported photo can
+        # carry a different prefix in the import than the project's stored copy,
+        # yet shares an id. (Filename matching is why the red row could flag an
+        # image while no redefine overlay appeared on it.)
+        current_sid = self._current_stable_image_id()
         overlays: list[dict] = []
         for entry in self.project.unmapped_entries_visible_on_level(level):
-            if os.path.basename(str(entry.get("file_name", ""))) != basename:
+            if current_sid is None or self._entry_image_id(entry) != current_sid:
                 continue
             points = self._raw_geometry_points(entry.get("source_annotation", {}) or {})
             if len(points) < 2:
@@ -5282,7 +5407,15 @@ class PyQtAnnotationReview(QMainWindow):
         if converted is None:
             self._show_message("Could not assign: this object has no usable geometry for this level.")
             return
-        basename = os.path.basename(str(entry.get("file_name", ""))) or self._current_image_basename()
+        # Store under the PROJECT's basename for this image (resolved by stable id),
+        # so the new object lands on the key the canvas actually renders — not the
+        # import filename, which may carry a different prefix (else it "vanishes").
+        sid = self._entry_image_id(entry)
+        record = self.project.image_record(sid) if sid is not None else None
+        basename = (
+            os.path.basename(str(record["file_name"])) if record is not None
+            else os.path.basename(str(entry.get("file_name", ""))) or self._current_image_basename()
+        )
         store = self.annotation_store[level].setdefault(basename, [])
         store.append(converted)
         ok, _count, _name = self._write_level_file(level)  # commit this level to disk
@@ -5576,6 +5709,8 @@ class PyQtAnnotationReview(QMainWindow):
     def _update_status_labels(self) -> None:
         self._refresh_canvas_placeholder()
         self._refresh_incomplete_flags()  # keep the amber "empty level" rows current
+        if getattr(self, "image_id_label", None) is not None:
+            self.image_id_label.setText(self._current_image_id_text())
         if self.mode == "annotation":
             active = self._active_category()
             active_name = levels.class_name_for_category(self.annotation_level, active) if active is not None else None
@@ -5696,6 +5831,11 @@ class PyQtAnnotationReview(QMainWindow):
         if not self._confirm_discard_unsaved("quit"):
             event.ignore()
             return
+        # These pop-outs are now parentless top-level windows, so closing the main
+        # window won't auto-close them (and the app wouldn't quit). Close them here.
+        for popout in (self.canvas_popout, self.class_popout):
+            if popout is not None:
+                popout.close()
         self._cleanup_temp_extraction()
         super().closeEvent(event)
 
