@@ -293,6 +293,55 @@ def test_applog_prune_keeps_most_recent() -> None:
         assert remaining == ["session_2.log", "session_3.log", "session_4.log"]
 
 
+def test_label_studio_parses_polygons_and_boxes() -> None:
+    # L1/L3 Label Studio exports use polygonlabels; L2 uses (rotated) rectanglelabels.
+    # Both must parse from one export (the L1/L3 polygon case was silently dropped).
+    from src.data_loading import _parse_label_studio
+
+    tasks = [
+        {
+            "data": {"image": "/up/img_000000001.jpg"},
+            "annotations": [
+                {
+                    "result": [
+                        {
+                            "type": "polygonlabels",
+                            "original_width": 100,
+                            "original_height": 200,
+                            "value": {
+                                "points": [[10, 10], [50, 10], [50, 40]],  # percentages
+                                "polygonlabels": ["road_asphalt"],
+                            },
+                        },
+                        {
+                            "type": "rectanglelabels",
+                            "original_width": 100,
+                            "original_height": 200,
+                            "value": {
+                                "x": 10, "y": 5, "width": 20, "height": 10, "rotation": 30,
+                                "rectanglelabels": ["car"],
+                            },
+                        },
+                    ]
+                }
+            ],
+        }
+    ]
+    _images, _by_id, annotations_by_image_id, categories = _parse_label_studio(tasks)
+    anns = annotations_by_image_id[0]
+    assert len(anns) == 2
+    by_class = {categories[a["category_id"]]: a for a in anns}
+
+    poly = by_class["road_asphalt"]
+    assert len(poly["segmentation"][0]) == 6  # 3 points -> 6 coords (a real polygon)
+    assert poly["segmentation"][0][:2] == [10.0, 20.0]  # 10% of (100, 200) -> pixels
+    assert poly["rotation"] == 0.0
+
+    box = by_class["car"]
+    assert len(box["segmentation"][0]) == 8  # rotated 4-corner quad
+    assert abs(box["rotation"] - 30.0) < 1e-9  # rotation preserved
+
+
 def _run_all() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = 0

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import colorsys
+import contextlib
 import copy
 import json
 import math
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from .constants import DPI_SCALE, MONITOR_HEIGHT, MONITOR_WIDTH, SIDEBAR_WIDTH
@@ -24,7 +26,7 @@ from . import levels
 from .project import Project, ProjectError
 
 try:
-    from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, pyqtSignal
+    from PyQt6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import (
         QAction,
         QClipboard,
@@ -65,6 +67,7 @@ try:
         QSpinBox,
         QStackedWidget,
         QStyledItemDelegate,
+        QTextEdit,
         QVBoxLayout,
         QWidget,
     )
@@ -1221,7 +1224,9 @@ class ImageCanvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             if len(screen_points) >= 2:
                 painter.drawPolyline(QPolygonF(screen_points))
-            if self._cursor_image is not None:
+            # The rubber-band segment to the cursor previews the NEXT point — show it
+            # only while placing points, not while dragging an already-placed one.
+            if self._cursor_image is not None and self._drag_pending_index is None:
                 cursor_point = QPointF(image_x + self._cursor_image[0] * self._zoom, image_y + self._cursor_image[1] * self._zoom)
                 painter.drawLine(screen_points[-1], cursor_point)
             radius = self._handle_size
@@ -1575,6 +1580,9 @@ class ImageCanvas(QWidget):
                 moved = self._pending_moved
                 self._drag_pending_index = None
                 self._pending_moved = False
+                # Drop the stale cursor so the rubber-band preview doesn't snap back
+                # to where the point was grabbed; it returns on the next mouse move.
+                self._cursor_image = None
                 self.setCursor(Qt.CursorShape.CrossCursor)
                 if not moved:
                     if index == 0 and len(self._poly_points) >= 3:
@@ -1655,15 +1663,20 @@ class ImageCanvas(QWidget):
 
 
 class RedefineRowDelegate(QStyledItemDelegate):
-    """Paints a red background behind image-selector rows flagged as needing
-    redefinition. A delegate is used because the view's QSS (``::item`` background)
-    overrides any model BackgroundRole, so colors set on the item don't show."""
+    """Paints image-selector row backgrounds to flag work to do:
+      • RED  (FLAG_ROLE)       — the image still has an object to redefine.
+      • AMBER (INCOMPLETE_ROLE) — at least one level is completely empty for it.
+    Red wins when both apply. A delegate is used because the view's QSS
+    (``::item`` background) overrides any model BackgroundRole."""
 
     FLAG_ROLE = Qt.ItemDataRole.UserRole + 100
+    INCOMPLETE_ROLE = Qt.ItemDataRole.UserRole + 101
 
     def paint(self, painter, option, index) -> None:  # noqa: N802
         if index.data(self.FLAG_ROLE):
-            painter.fillRect(option.rect, QColor(120, 45, 48))
+            painter.fillRect(option.rect, QColor(120, 45, 48))   # needs redefine
+        elif index.data(self.INCOMPLETE_ROLE):
+            painter.fillRect(option.rect, QColor(122, 82, 28))   # a level is empty
         super().paint(painter, option, index)
 
 
@@ -2489,6 +2502,9 @@ class PyQtAnnotationReview(QMainWindow):
         # Which level files have unsaved edits (per-level dirty tracking). The
         # master ``_dirty`` flag mirrors ``bool(self._dirty_levels)``.
         self._dirty_levels: set[int] = set()
+        # Wall-clock of the last successful level-file write this session (None until
+        # the first save). Drives the "✓ saved …" status reassurance.
+        self._last_saved_at: float | None = None
         # True while the sidebar shows the redefine "assign a class" catalog panel.
         self._redefine_panel_active = False
         # Undo/redo history of geometry edit records ({annotation, before, after, image_index}).
@@ -2539,6 +2555,13 @@ class PyQtAnnotationReview(QMainWindow):
         self.canvas.selectionChanged.connect(self._on_selection_changed)
 
         self._init_shortcuts()
+
+        # Keep the "✓ saved … ago" tail current while the user is idle (the status
+        # bar otherwise only refreshes on interaction).
+        self._status_tick = QTimer(self)
+        self._status_tick.setInterval(30_000)
+        self._status_tick.timeout.connect(self._update_status_labels)
+        self._status_tick.start()
 
     # ----- editable keyboard shortcuts ------------------------------------
     @staticmethod
@@ -3018,6 +3041,13 @@ class PyQtAnnotationReview(QMainWindow):
         self.popout_button.setToolTip("Open the class list in a separate, resizable window")
         self.popout_button.clicked.connect(self._toggle_class_popout)
 
+        self.export_zip_button = QPushButton("⤓ Export zip")
+        self.export_zip_button.setObjectName("statusHelpButton")
+        self.export_zip_button.setFixedHeight(max(18, int(round(20 * DPI_SCALE))))
+        self.export_zip_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_zip_button.setToolTip("Bundle the whole project into one shareable / back-up zip")
+        self.export_zip_button.clicked.connect(self._export_project_zip)
+
         self.help_button = QPushButton("⌨ Shortcuts")
         self.help_button.setObjectName("statusHelpButton")
         self.help_button.setFixedHeight(max(18, int(round(20 * DPI_SCALE))))
@@ -3031,6 +3061,7 @@ class PyQtAnnotationReview(QMainWindow):
         status_bar.addPermanentWidget(self.canvas_popout_button)
         status_bar.addPermanentWidget(self.popout_button)
         status_bar.addPermanentWidget(self.help_button)
+        status_bar.addPermanentWidget(self.export_zip_button)  # far-right corner, right of Shortcuts
 
         # Start on the welcome screen until a project is created/opened.
         self._update_project_chrome()
@@ -3122,6 +3153,14 @@ class PyQtAnnotationReview(QMainWindow):
         open_button.setCursor(Qt.CursorShape.PointingHandCursor)
         open_button.clicked.connect(self._open_project)
         column.addWidget(open_button)
+
+        column.addSpacing(4)
+        help_button = QPushButton("How it works")
+        help_button.setObjectName("statusHelpButton")  # quiet link-style, not a primary action
+        help_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        help_button.setToolTip("A quick tour of projects, levels, modes and editing")
+        help_button.clicked.connect(self._show_workflow_help)
+        column.addWidget(help_button, 0, Qt.AlignmentFlag.AlignHCenter)
 
         container = QWidget()
         container.setLayout(column)
@@ -3218,6 +3257,8 @@ class PyQtAnnotationReview(QMainWindow):
             self.action_close_project.setEnabled(has_project)
         if hasattr(self, "action_export_zip"):
             self.action_export_zip.setEnabled(has_project)
+        if hasattr(self, "export_zip_button"):
+            self.export_zip_button.setVisible(has_project)
         if hasattr(self, "import_menu"):
             self.import_menu.setEnabled(has_project)
             # Annotations need images to attach to: greyed until the project has any.
@@ -3336,6 +3377,7 @@ class PyQtAnnotationReview(QMainWindow):
     def _activate_project(self, project: Project) -> None:
         """Make ``project`` the open project and load its images/levels into the session."""
         self.project = project
+        self._last_saved_at = None  # "✓ saved" is scoped to this project session
         # Rescue any stashed orphans whose image is already present (e.g. ones a
         # past routing bug stashed despite the image being in the project) before
         # we read the level files into the session.
@@ -3411,6 +3453,24 @@ class PyQtAnnotationReview(QMainWindow):
         self._sync_canvas_state()
         self._sync_draw_state()
 
+    @contextlib.contextmanager
+    def _busy(self, message: str):
+        """Show a wait cursor + status message while a blocking operation runs.
+
+        Imports copy/extract/parse on the UI thread; without feedback the window
+        looks frozen ("Not Responding"). This flips the cursor and the status line
+        so the user sees progress, and always restores them — even on error.
+        """
+        previous = self.status_label.text()
+        self.status_label.setText(message)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()  # paint the cursor + status before we block
+        try:
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.status_label.setText(previous)  # _update_status_labels resets it shortly after
+
     def _import_image_folder(self) -> None:
         """Import: copy an image folder into the project (dedup), then promote stash."""
         if self.project is None:
@@ -3422,8 +3482,9 @@ class PyQtAnnotationReview(QMainWindow):
             return
         source_dir = discover_images_dir(folder)
         try:
-            report = self.project.import_images(source_dir)
-            promoted = self.project.promote_pending()
+            with self._busy("Importing images…"):
+                report = self.project.import_images(source_dir)
+                promoted = self.project.promote_pending()
         except ProjectError as error:
             self._show_message(str(error))
             return
@@ -3452,12 +3513,13 @@ class PyQtAnnotationReview(QMainWindow):
             return
         temp_extraction = None
         try:
-            images_path, annotations_path, temp_extraction = resolve_dataset_paths(zip_path)
-            self.project.import_images(images_path, source=f"zip:{Path(zip_path).name}")
-            self.project.promote_pending()
-            images, _by_id, annotations_by_image_id, categories_by_id = load_coco_data(
-                annotations_path, images_path
-            )
+            with self._busy("Importing zip…"):
+                images_path, annotations_path, temp_extraction = resolve_dataset_paths(zip_path)
+                self.project.import_images(images_path, source=f"zip:{Path(zip_path).name}")
+                self.project.promote_pending()
+                images, _by_id, annotations_by_image_id, categories_by_id = load_coco_data(
+                    annotations_path, images_path
+                )
         except Exception as error:  # noqa: BLE001 - surface any extract/parse failure
             self._show_message(f"Could not import zip: {error}")
             return
@@ -3484,9 +3546,10 @@ class PyQtAnnotationReview(QMainWindow):
         if not json_path:
             return
         try:
-            images, _by_id, annotations_by_image_id, categories_by_id = load_coco_data(
-                json_path, str(self.project.images_dir)
-            )
+            with self._busy("Loading annotations…"):
+                images, _by_id, annotations_by_image_id, categories_by_id = load_coco_data(
+                    json_path, str(self.project.images_dir)
+                )
         except Exception as error:  # noqa: BLE001
             self._show_message(f"Could not load annotations: {error}")
             return
@@ -4506,7 +4569,16 @@ class PyQtAnnotationReview(QMainWindow):
             ys = [p[1] for p in points]
             envelope = list(bbox[:4]) if (bbox and len(bbox) >= 4) else [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
             if is_box_level:
-                # A polygon class remapped to the box level becomes its envelope.
+                if len(points) == 4:
+                    # An oriented box (e.g. a Label Studio rotated rectangle): KEEP its
+                    # rotated 4-corner quad + angle. Collapsing to the envelope here was
+                    # silently dropping rotation when importing such exports.
+                    out["segmentation"] = [list(contour)]
+                    out["bbox"] = [float(v) for v in envelope[:4]]
+                    out["area"] = annotation.get("area") or polygon_area(points)
+                    out["rotation"] = float(annotation.get("rotation", 0) or 0)
+                    return out
+                # A real polygon class remapped to the box level becomes its envelope.
                 x, y, width, height = (float(v) for v in envelope[:4])
                 out["bbox"] = [x, y, width, height]
                 out["area"] = width * height
@@ -4564,16 +4636,39 @@ class PyQtAnnotationReview(QMainWindow):
                     sid = stable_image_id(filename)
                 if int(sid) in redefine_ids:
                     self.image_selector.setItemData(i, True, RedefineRowDelegate.FLAG_ROLE)
+                # Amber when any level is completely empty for this image.
+                if self.project is not None and any(
+                    not self.annotation_store[lvl].get(filename) for lvl in levels.LEVEL_IDS
+                ):
+                    self.image_selector.setItemData(i, True, RedefineRowDelegate.INCOMPLETE_ROLE)
             
             # Keep the placeholder text visible by not setting current index
             # This way users always see "Select image" in the combo box
             self.image_selector.setCurrentIndex(-1)
         
         self.image_selector.blockSignals(False)
-        
+
         # Manually trigger the selection handler
         if self.images:
             self._on_image_selected(self.index)
+
+    def _refresh_incomplete_flags(self) -> None:
+        """Re-mark image-selector rows amber when any level is empty for that image.
+
+        Cheap (just toggles the row role, no combo rebuild) so it can run after every
+        edit — the amber clears the moment an image's last empty level gets an object.
+        """
+        selector = getattr(self, "image_selector", None)
+        if selector is None or not self.images or self.project is None:
+            return
+        for pos in range(selector.count()):
+            index = selector.itemData(pos)
+            if not isinstance(index, int) or not (0 <= index < len(self.images)):
+                continue
+            image_info = self.images[index]
+            filename = os.path.basename(str(image_info.get("file_name", ""))) if isinstance(image_info, dict) else ""
+            incomplete = any(not self.annotation_store[lvl].get(filename) for lvl in levels.LEVEL_IDS)
+            selector.setItemData(pos, True if incomplete else None, RedefineRowDelegate.INCOMPLETE_ROLE)
 
     def _on_image_selected(self, index: int) -> None:
         """Handle image selection from the combo box."""
@@ -4699,47 +4794,128 @@ class PyQtAnnotationReview(QMainWindow):
         except Exception as error:  # noqa: BLE001
             self._show_message(f"Could not open the logs folder: {error}")
 
+    _HELP_EN = (
+        "PROJECTS\n"
+        "• Project ▸ New / Open creates or opens a self-contained project folder\n"
+        "  (images + annotations/level1‑3.json). Everything lives there.\n"
+        "• Import ▸ Open zip / image folder / annotations adds data. Images are\n"
+        "  de-duplicated; annotations are sorted into the 3 levels by class name.\n"
+        "• Project ▸ Export as zip… bundles the whole project to share.\n\n"
+        "LEVELS  (L1 surfaces · L2 objects/boxes · L3 details)\n"
+        "• The L1/L2/L3 selector picks which level you review or draw. L1 & L3 are\n"
+        "  polygons; L2 is (optionally rotated) boxes.\n\n"
+        "MODES\n"
+        "• Validation — review existing annotations; the class list shows only the\n"
+        "  classes present on the current image (toggle visibility, Show/Hide all).\n"
+        "• Annotate — draw new objects with the Draw tool (D). Both modes share the\n"
+        "  same per-level data and save the same level files.\n\n"
+        "EDITING\n"
+        "• Edit objects (T): select an object first — only the SELECTED object shows\n"
+        "  its handles. Drag a corner/vertex to move it. On polygons, click a vertex\n"
+        "  then Delete to remove it, or right-click an edge to add one. Drag an L2 box\n"
+        "  body to move it whole, or its round handle to rotate it.\n"
+        "• While drawing: click to place points, drag a point to move it, right-click\n"
+        "  to insert, Enter/double-click to finish, Esc to cancel.\n"
+        "• Select an object to change its class (sidebar catalog) or delete it (Del).\n"
+        "  Edits are undoable (Ctrl+Z / Ctrl+Y) and saved per level (Ctrl+S / Save all).\n\n"
+        "REDEFINE\n"
+        "• Imported classes not in the catalog are parked (dashed magenta) and shown\n"
+        "  on every level until assigned. Images holding one are marked red in the\n"
+        "  image list. Click such an object to assign it a class, or use\n"
+        "  Project ▸ Redefine classes… to remap them in bulk.\n\n"
+        "The app closes only via the window's close button (it prompts to save)."
+    )
+
+    # Czech translation of _HELP_EN. App UI labels (menu / button names) are kept in
+    # English on purpose so they match the actual (English) interface.
+    _HELP_CZ = (
+        "PROJEKTY\n"
+        "• Project ▸ New / Open vytvoří nebo otevře samostatnou složku projektu\n"
+        "  (obrázky + annotations/level1‑3.json). Vše je uloženo zde.\n"
+        "• Import ▸ Open zip / image folder / annotations přidá data. Obrázky se\n"
+        "  deduplikují; anotace se třídí do 3 úrovní podle názvu třídy.\n"
+        "• Project ▸ Export as zip… zabalí celý projekt ke sdílení.\n\n"
+        "ÚROVNĚ  (L1 povrchy · L2 objekty/boxy · L3 detaily)\n"
+        "• Přepínač L1/L2/L3 určuje, kterou úroveň prohlížíte nebo kreslíte. L1 a L3\n"
+        "  jsou polygony; L2 jsou (volitelně otočené) boxy.\n\n"
+        "REŽIMY\n"
+        "• Validation — kontrola existujících anotací; seznam tříd ukazuje pouze třídy\n"
+        "  přítomné na aktuálním obrázku (přepínání viditelnosti, Show/Hide all).\n"
+        "• Annotate — kreslení nových objektů nástrojem Draw (D). Oba režimy sdílejí\n"
+        "  stejná data podle úrovní a ukládají stejné soubory úrovní.\n\n"
+        "ÚPRAVY\n"
+        "• Edit objects (T): nejprve vyberte objekt — úchyty zobrazuje pouze VYBRANÝ\n"
+        "  objekt. Tažením rohu/vrcholu jej posunete. U polygonů klikněte na vrchol a\n"
+        "  klávesou Delete jej odeberete, nebo pravým tlačítkem na hranu přidáte nový.\n"
+        "  Tažením těla L2 boxu jej posunete celý, kulatým úchytem jej otočíte.\n"
+        "• Při kreslení: klikáním umísťujete body, tažením bodu jej posunete, pravým\n"
+        "  tlačítkem vložíte bod, Enter/dvojklik dokončí, Esc zruší.\n"
+        "• Vyberte objekt pro změnu jeho třídy (katalog v postranním panelu) nebo jeho\n"
+        "  smazání (Del). Úpravy lze vrátit zpět (Ctrl+Z / Ctrl+Y) a ukládají se po\n"
+        "  úrovních (Ctrl+S / Save all).\n\n"
+        "REDEFINICE\n"
+        "• Importované třídy, které nejsou v katalogu, se odloží (čárkovaně purpurově)\n"
+        "  a zobrazují se na každé úrovni, dokud nejsou přiřazeny. Obrázky, které\n"
+        "  takový objekt obsahují, jsou v seznamu obrázků označeny červeně. Klikněte na\n"
+        "  takový objekt pro přiřazení třídy, nebo použijte Project ▸ Redefine classes…\n"
+        "  pro hromadné přemapování.\n\n"
+        "Aplikaci lze zavřít pouze tlačítkem pro zavření okna (vyzve k uložení)."
+    )
+
     def _show_workflow_help(self) -> None:
-        """Explain the project → levels → modes → editing workflow."""
-        text = (
-            "PROJECTS\n"
-            "• Project ▸ New / Open creates or opens a self-contained project folder\n"
-            "  (images + annotations/level1‑3.json). Everything lives there.\n"
-            "• Import ▸ Open zip / image folder / annotations adds data. Images are\n"
-            "  de-duplicated; annotations are sorted into the 3 levels by class name.\n"
-            "• Project ▸ Export as zip… bundles the whole project to share.\n\n"
-            "LEVELS  (L1 surfaces · L2 objects/boxes · L3 details)\n"
-            "• The L1/L2/L3 selector picks which level you review or draw. L1 & L3 are\n"
-            "  polygons; L2 is (optionally rotated) boxes.\n\n"
-            "MODES\n"
-            "• Validation — review existing annotations; the class list shows only the\n"
-            "  classes present on the current image (toggle visibility, Show/Hide all).\n"
-            "• Annotate — draw new objects with the Draw tool (D). Both modes share the\n"
-            "  same per-level data and save the same level files.\n\n"
-            "EDITING\n"
-            "• Edit objects (T): select an object first — only the SELECTED object shows\n"
-            "  its handles. Drag a corner/vertex to move it. On polygons, click a vertex\n"
-            "  then Delete to remove it, or right-click an edge to add one. Drag an L2 box\n"
-            "  body to move it whole, or its round handle to rotate it.\n"
-            "• While drawing: click to place points, drag a point to move it, right-click\n"
-            "  to insert, Enter/double-click to finish, Esc to cancel.\n"
-            "• Select an object to change its class (sidebar catalog) or delete it (Del).\n"
-            "  Edits are undoable (Ctrl+Z / Ctrl+Y) and saved per level (Ctrl+S / Save all).\n\n"
-            "REDEFINE\n"
-            "• Imported classes not in the catalog are parked (dashed magenta) and shown\n"
-            "  on every level until assigned. Images holding one are marked red in the\n"
-            "  image list. Click such an object to assign it a class, or use\n"
-            "  Project ▸ Redefine classes… to remap them in bulk.\n\n"
-            "The app closes only via the window's close button (it prompts to save)."
+        """Explain the project → levels → modes → editing workflow (EN / CZ toggle)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("How it works")
+        dialog.setStyleSheet(
+            _DARK_DIALOG_QSS
+            + "QLabel#helpHeading { font-size: 15px; font-weight: 600; }"
+            + "QTextEdit#helpBody { background:#15171a; border:1px solid #2a2e34;"
+            "  border-radius:6px; padding:8px; font-family:Consolas,'Courier New',monospace; }"
+            + "QPushButton#langButton { min-width:38px; padding:3px 10px; }"
+            + "QPushButton#langButton:checked { background:#6a72e6; border-color:#8088ff; color:#ffffff; }"
         )
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.NoIcon)
-        box.setWindowTitle("How it works")
-        box.setText(text)
-        box.setTextFormat(Qt.TextFormat.PlainText)
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.setStyleSheet(_DARK_DIALOG_QSS + "QLabel { min-width: 560px; } QPushButton { min-width: 72px; }")
-        box.exec()
+        dialog.resize(max(680, int(round(740 * DPI_SCALE))), max(480, int(round(560 * DPI_SCALE))))
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        # Header row: title on the left, EN / CZ language toggle in the top-right.
+        top = QHBoxLayout()
+        heading = QLabel("How it works")
+        heading.setObjectName("helpHeading")
+        top.addWidget(heading)
+        top.addStretch(1)
+        lang_group = QButtonGroup(dialog)
+        lang_group.setExclusive(True)
+        en_button = QPushButton("EN")
+        cz_button = QPushButton("CZ")
+        for button in (en_button, cz_button):
+            button.setObjectName("langButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            lang_group.addButton(button)
+            top.addWidget(button)
+        en_button.setChecked(True)  # default to English
+        layout.addLayout(top)
+
+        body = QTextEdit()
+        body.setObjectName("helpBody")
+        body.setReadOnly(True)
+        body.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        body.setPlainText(self._HELP_EN)
+        layout.addWidget(body, 1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.clicked.connect(dialog.accept)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+        en_button.clicked.connect(lambda: body.setPlainText(self._HELP_EN))
+        cz_button.clicked.connect(lambda: body.setPlainText(self._HELP_CZ))
+        dialog.exec()
 
     def _original_size(self) -> None:
         self.canvas.reset_to_original_size()
@@ -4874,6 +5050,23 @@ class PyQtAnnotationReview(QMainWindow):
         if self.project is not None and self._dirty_levels:
             return "   ·   ● unsaved: " + ", ".join(f"L{n}" for n in sorted(self._dirty_levels))
         return "   ·   ● unsaved edits"
+
+    def _saved_suffix(self) -> str:
+        """Status-bar tail confirming the last save ('✓ saved … ago'), or ''."""
+        if self._last_saved_at is None:
+            return ""
+        elapsed = max(0.0, time.time() - self._last_saved_at)
+        if elapsed < 60:
+            when = "just now"
+        elif elapsed < 3600:
+            when = f"{int(elapsed // 60)}m ago"
+        else:
+            when = f"{int(elapsed // 3600)}h ago"
+        return f"   ·   ✓ saved {when}"
+
+    def _save_state_suffix(self) -> str:
+        """Unsaved marker when dirty, else the last-saved confirmation."""
+        return self._unsaved_suffix() or self._saved_suffix()
 
     def _on_annotations_changed(self, record: dict | None = None) -> None:
         """A vertex was dragged on the canvas; record the edit for undo and refresh."""
@@ -5283,6 +5476,7 @@ class PyQtAnnotationReview(QMainWindow):
         except OSError as error:
             self._show_message(f"Could not save {path.name}: {error}")
             return False, 0, path.name
+        self._last_saved_at = time.time()  # every save path funnels through here
         return True, len(coco["annotations"]), path.name
 
     def _persist_all_levels(self) -> tuple[bool, int, list[str]]:
@@ -5381,6 +5575,7 @@ class PyQtAnnotationReview(QMainWindow):
 
     def _update_status_labels(self) -> None:
         self._refresh_canvas_placeholder()
+        self._refresh_incomplete_flags()  # keep the amber "empty level" rows current
         if self.mode == "annotation":
             active = self._active_category()
             active_name = levels.class_name_for_category(self.annotation_level, active) if active is not None else None
@@ -5392,7 +5587,7 @@ class PyQtAnnotationReview(QMainWindow):
                 parts.insert(1, f"{self.index + 1}/{len(self.images)}")
             parts.append(f"class: {active_name}" if active_name else "class: none")
             text = "   ·   ".join(parts)
-            text += self._unsaved_suffix()
+            text += self._save_state_suffix()
             self.status_label.setText(text)
             self.copy_id_button.setEnabled(bool(self.images))
             return
@@ -5428,7 +5623,7 @@ class PyQtAnnotationReview(QMainWindow):
             parts = [level_part, f"{len(self.images)} images", f"{class_count} classes", f"Zoom {zoom}%"]
 
         text = "   ·   ".join(part for part in parts if part)
-        text += self._unsaved_suffix()
+        text += self._save_state_suffix()
         self.status_label.setText(text)
 
     def _handle_escape(self) -> bool:

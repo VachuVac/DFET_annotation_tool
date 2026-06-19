@@ -26,7 +26,7 @@ LEVELS: dict[int, dict] = {
         "title": "Surfaces & terrain",
         "geometry": GEOMETRY_POLYGON,
         "groups": [
-            ("INFRASTRUKTURA", [
+            ("INFRASTRUCTURE", [
                 ("road_asphalt", "#FFE119"),
                 ("road_concrete", "#3CB44B"),
                 ("road_paved", "#F58231"),
@@ -37,7 +37,7 @@ LEVELS: dict[int, dict] = {
                 ("train_tracks", "#000075"),
                 ("ditch", "#BFEF45"),
             ]),
-            ("MATERIÁLY A TERÉN", [
+            ("MATERIALS & TERRAIN", [
                 ("asphalt", "#FABED4"),
                 ("concrete", "#469990"),
                 ("sett_pavement", "#DCBEFF"),
@@ -47,7 +47,7 @@ LEVELS: dict[int, dict] = {
                 ("snow", "#843939"),
                 ("water", "#008080"),
             ]),
-            ("OBJEKTY A OSTATNÍ", [
+            ("OBJECTS & OTHER", [
                 ("building", "#808000"),
                 ("structure", "#A9A9A9"),
                 ("undefined", "#00FF00"),
@@ -58,20 +58,20 @@ LEVELS: dict[int, dict] = {
         "title": "Details (boxes)",
         "geometry": GEOMETRY_ROTATED_BBOX,
         "groups": [
-            ("VEGETACE", [
+            ("VEGETATION", [
                 ("medium_vegetation", "#42D4F4"),
                 ("high_vegetation", "#F032E6"),
             ]),
-            ("ZNAČENÍ A STOPY", [
+            ("MARKINGS & TRACES", [
                 ("road_sign_pictogram", "#FFE119"),
                 ("vehicle_altered_surface", "#E6194B"),
                 ("spray_mark", "#F58231"),
             ]),
-            ("MATERIÁLY A NEČISTOTY", [
+            ("MATERIALS & DIRT", [
                 ("oil_absorbent", "#BFEF45"),
                 ("liquid", "#4363D8"),
             ]),
-            ("TROSKY A OSTATNÍ", [
+            ("DEBRIS & OTHER", [
                 ("debris_small", "#DCBEFF"),
                 ("debris_large", "#9A6324"),
                 ("other", "#AAFFC3"),
@@ -82,7 +82,7 @@ LEVELS: dict[int, dict] = {
         "title": "Objects",
         "geometry": GEOMETRY_POLYGON,
         "groups": [
-            ("VOZIDLA A DOPRAVA", [
+            ("VEHICLES & TRANSPORT", [
                 ("micromobility", "#FFE119"),
                 ("cyclist", "#4363D8"),
                 ("motorcycle_undamaged", "#3CB44B"),
@@ -113,7 +113,7 @@ LEVELS: dict[int, dict] = {
                 ("caravan", "#E6BEFF"),
                 ("trailer", "#00FF00"),
             ]),
-            ("DOPRAVNÍ PRVKY A ZNAČENÍ", [
+            ("TRAFFIC ELEMENTS & SIGNAGE", [
                 ("road_marking", "#DCDCDC"),
                 ("traffic_sign", "#B03060"),
                 ("traffic_light", "#ADFF2F"),
@@ -122,7 +122,7 @@ LEVELS: dict[int, dict] = {
                 ("guardrail_concrete", "#556B2F"),
                 ("curb", "#8B4513"),
             ]),
-            ("LIDÉ A OSTATNÍ OBJEKTY", [
+            ("PEOPLE & OTHER OBJECTS", [
                 ("animal", "#A52A2A"),
                 ("human", "#F08080"),
                 ("emergency_responders", "#00FFFF"),

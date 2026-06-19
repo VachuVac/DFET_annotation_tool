@@ -228,14 +228,28 @@ def _rotated_rectangle_corners(x: float, y: float, width: float, height: float, 
     return [(x + dx * cos_a - dy * sin_a, y + dx * sin_a + dy * cos_a) for dx, dy in local]
 
 
+def _polygon_area(points) -> float:
+    """Shoelace area of a polygon given its (x, y) vertices."""
+    area = 0.0
+    count = len(points)
+    for index in range(count):
+        x1, y1 = points[index]
+        x2, y2 = points[(index + 1) % count]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
 def _parse_label_studio(tasks: list):
     """Build dataset metadata from a Label Studio native export.
 
-    Each rectangle region (``rectanglelabels``) becomes an annotation whose
-    ``segmentation`` is the rotated 4-corner quad, so oriented boxes render
-    through the existing polygon pipeline. ``bbox`` is the axis-aligned envelope.
-    Coordinates in the export are percentages of the image; rotation is in
-    degrees clockwise around the box's top-left corner.
+    Handles both region kinds an export can carry:
+    * ``rectanglelabels`` — a (possibly rotated) box; ``segmentation`` is the
+      rotated 4-corner quad and ``rotation`` is degrees clockwise around the
+      box's top-left corner (so oriented boxes ride the existing pipeline).
+    * ``polygonlabels`` — a free polygon; ``segmentation`` is its outline.
+
+    ``bbox`` is always the axis-aligned envelope. Coordinates in the export are
+    percentages of the image, so they are scaled by the region's pixel size.
     """
     images: list[dict] = []
     images_by_id: dict[int, dict] = {}
@@ -253,7 +267,7 @@ def _parse_label_studio(tasks: list):
             region
             for annotation in (task.get("annotations", []) or [])
             for region in (annotation.get("result", []) or [])
-            if isinstance(region, dict) and region.get("type") == "rectanglelabels"
+            if isinstance(region, dict) and region.get("type") in ("rectanglelabels", "polygonlabels")
         ]
 
         width = regions[0].get("original_width") if regions else None
@@ -265,31 +279,55 @@ def _parse_label_studio(tasks: list):
             continue
 
         for region in regions:
+            region_type = region.get("type")
             value = region.get("value", {}) or {}
-            labels = value.get("rectanglelabels") or []
-            if not labels:
-                continue
-            name = labels[0]
+
+            if region_type == "rectanglelabels":
+                labels = value.get("rectanglelabels") or []
+                if not labels:
+                    continue
+                name = labels[0]
+                box_x = float(value.get("x", 0.0)) / 100.0 * width
+                box_y = float(value.get("y", 0.0)) / 100.0 * height
+                box_w = float(value.get("width", 0.0)) / 100.0 * width
+                box_h = float(value.get("height", 0.0)) / 100.0 * height
+                rotation = float(value.get("rotation", 0.0) or 0.0)
+                corners = _rotated_rectangle_corners(box_x, box_y, box_w, box_h, rotation)
+                xs = [corner[0] for corner in corners]
+                ys = [corner[1] for corner in corners]
+                segmentation = [[coord for corner in corners for coord in corner]]
+                bbox = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+                area = box_w * box_h
+            else:  # polygonlabels (L1/L3 free polygons)
+                labels = value.get("polygonlabels") or []
+                raw_points = value.get("points") or []
+                if not labels:
+                    continue
+                points = [
+                    (float(point[0]) / 100.0 * width, float(point[1]) / 100.0 * height)
+                    for point in raw_points
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ]
+                if len(points) < 3:
+                    continue  # not a polygon
+                name = labels[0]
+                xs = [point[0] for point in points]
+                ys = [point[1] for point in points]
+                segmentation = [[coord for point in points for coord in point]]
+                bbox = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
+                area = _polygon_area(points)
+                rotation = 0.0
+
             if name not in name_to_category_id:
                 name_to_category_id[name] = len(name_to_category_id)
-
-            box_x = float(value.get("x", 0.0)) / 100.0 * width
-            box_y = float(value.get("y", 0.0)) / 100.0 * height
-            box_w = float(value.get("width", 0.0)) / 100.0 * width
-            box_h = float(value.get("height", 0.0)) / 100.0 * height
-            rotation = float(value.get("rotation", 0.0) or 0.0)
-
-            corners = _rotated_rectangle_corners(box_x, box_y, box_w, box_h, rotation)
-            xs = [corner[0] for corner in corners]
-            ys = [corner[1] for corner in corners]
             annotations_by_image_id[image_id].append(
                 {
                     "id": annotation_id,
                     "image_id": image_id,
                     "category_id": name_to_category_id[name],
-                    "segmentation": [[coord for corner in corners for coord in corner]],
-                    "bbox": [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)],
-                    "area": box_w * box_h,
+                    "segmentation": segmentation,
+                    "bbox": bbox,
+                    "area": area,
                     "rotation": rotation,
                     "iscrowd": 0,
                     "ignore": 0,

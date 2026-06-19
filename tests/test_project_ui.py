@@ -60,6 +60,54 @@ def test_starts_on_welcome_screen() -> None:
     assert window.windowTitle() == "Annotation Workbench"
 
 
+def test_welcome_screen_help_link_opens_workflow() -> None:
+    from PyQt6.QtWidgets import QPushButton
+
+    calls = []
+    original = PyQtAnnotationReview._show_workflow_help
+    PyQtAnnotationReview._show_workflow_help = lambda self: calls.append(True)  # type: ignore[assignment]
+    try:
+        window = _window()
+        links = [b for b in window.welcome_page.findChildren(QPushButton) if b.text() == "How it works"]
+        assert len(links) == 1  # the onboarding link is present
+        links[0].click()
+        assert calls == [True]  # and wired to the workflow help
+    finally:
+        PyQtAnnotationReview._show_workflow_help = original  # type: ignore[assignment]
+
+
+def test_workflow_help_has_en_and_cz_translations() -> None:
+    en = PyQtAnnotationReview._HELP_EN
+    cz = PyQtAnnotationReview._HELP_CZ
+    assert en and cz and en != cz  # both present, genuinely different
+    # Same structure: identical bullet count and section count.
+    assert en.count("•") == cz.count("•")
+    assert en.count("\n\n") == cz.count("\n\n")
+    # Czech is actually translated (Czech section headers / diacritics present).
+    assert "ÚROVNĚ" in cz and "REŽIMY" in cz and "ÚPRAVY" in cz
+    # App UI labels stay in English in BOTH so they match the interface.
+    for token in ("Project ▸", "Validation", "Annotate", "Edit objects (T)"):
+        assert token in en and token in cz
+
+
+def test_busy_context_always_restores_cursor() -> None:
+    window = _window()
+    assert QApplication.overrideCursor() is None  # clean slate
+
+    with window._busy("working…"):
+        cursor = QApplication.overrideCursor()
+        assert cursor is not None and cursor.shape() == Qt.CursorShape.WaitCursor
+    assert QApplication.overrideCursor() is None  # restored on normal exit
+
+    # And restored even when the wrapped work raises (no leaked wait cursor).
+    try:
+        with window._busy("working…"):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert QApplication.overrideCursor() is None
+
+
 def test_activate_project_switches_to_main_view() -> None:
     window = _window()
     with tempfile.TemporaryDirectory() as parent:
@@ -492,6 +540,27 @@ def test_image_selector_items_are_numbered() -> None:
         assert "scene_000000001.png" in joined and "scene_000000002.png" in joined
 
 
+def test_image_selector_amber_flags_images_with_an_empty_level() -> None:
+    from src.qt_main import RedefineRowDelegate
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _routed_project_window(window, parent, src)  # L1 + L2 filled, L3 EMPTY
+        window._populate_image_selector()
+        sel = window.image_selector
+        pos = next(p for p in range(sel.count()) if sel.itemData(p) == 0)
+
+        # L3 has nothing yet -> the row is flagged amber (incomplete).
+        assert sel.itemData(pos, RedefineRowDelegate.INCOMPLETE_ROLE) is True
+
+        # Fill L3 for this image -> a status refresh clears the amber flag.
+        window.annotation_store[3].setdefault(basename, []).append(
+            {"category_id": 1, "segmentation": [[0, 0, 5, 0, 5, 5, 0, 5]], "bbox": [0, 0, 5, 5], "area": 25}
+        )
+        window._update_status_labels()
+        assert sel.itemData(pos, RedefineRowDelegate.INCOMPLETE_ROLE) in (None, False)
+
+
 def test_vertex_editable_flag_is_polygon_only() -> None:
     # Add/remove vertices is allowed on TRUE polygons (L1/L3) only; an axis box and
     # an oriented (rotated) L2 box must keep their 4-corner shape.
@@ -659,6 +728,80 @@ def test_pending_polygon_point_move_select_delete_insert() -> None:
         # Delete removes the selected pending point.
         assert canvas.delete_selected_pending_vertex() is True
         assert len(canvas._poly_points) == 4
+
+
+def test_drawing_preview_segment_hidden_while_dragging_point() -> None:
+    from PyQt6.QtGui import QPainter
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        canvas = window.canvas
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas.set_draw_shape("polygon", (255, 255, 255))
+        canvas._poly_points = [(0.5, 0.5), (3.5, 0.5), (3.5, 3.5)]
+        canvas._cursor_image = (2.0, 3.5)
+        canvas._selected_pending_index = None
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # A point on the cursor-preview segment (last point -> cursor), clear of the
+        # placed outline and point markers.
+        lx, ly = canvas._poly_points[-1]
+        cx, cy = canvas._cursor_image
+        mx = int(round(ix + (lx + cx) / 2 * z))
+        my = int(round(iy + (ly + cy) / 2 * z))
+
+        def render() -> QImage:
+            img = QImage(canvas.width(), canvas.height(), QImage.Format.Format_RGB32)
+            img.fill(0)
+            painter = QPainter(img)
+            canvas._draw_pending(painter, ix, iy)
+            painter.end()
+            return img
+
+        # Placing points: the rubber-band preview segment IS drawn.
+        canvas._drag_pending_index = None
+        assert render().pixelColor(mx, my).value() > 0
+
+        # Dragging an already-placed point: the preview segment is suppressed.
+        canvas._drag_pending_index = 1
+        assert render().pixelColor(mx, my).value() == 0
+
+
+def test_preview_segment_returns_only_after_move_post_release() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project_with_image(window, parent, src)
+        canvas = window.canvas
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas.set_draw_shape("polygon", (255, 255, 255))
+        canvas._poly_points = [(0.5, 0.5), (3.5, 0.5), (3.5, 3.5)]
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+
+        def screen(px, py):
+            return ix + px * z, iy + py * z
+
+        # Grab the last placed point and drag it.
+        sx, sy = screen(3.5, 3.5)
+        canvas.mousePressEvent(_FakeMouse(sx, sy, Qt.MouseButton.LeftButton))
+        assert canvas._drag_pending_index == 2
+        tx, ty = screen(2.5, 2.5)
+        canvas.mouseMoveEvent(_FakeMouse(tx, ty, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(tx, ty, Qt.MouseButton.LeftButton))
+
+        # On release the rubber-band cursor is cleared (no preview snaps back to the
+        # grab position) — it must NOT reappear until the mouse actually moves.
+        assert canvas._cursor_image is None
+
+        # A subsequent mouse move repopulates it, so the preview returns then.
+        mvx, mvy = screen(1.0, 1.0)
+        canvas.mouseMoveEvent(_FakeMouse(mvx, mvy, Qt.MouseButton.NoButton))
+        assert canvas._cursor_image is not None
 
 
 def test_rotate_selected_l2_box_drag_and_undo() -> None:
@@ -877,6 +1020,30 @@ def test_convert_coerces_polygon_to_box_for_box_level() -> None:
     assert len(converted["segmentation"][0]) == 8  # 4-corner quad
 
 
+def test_convert_preserves_oriented_box_rotation_for_l2() -> None:
+    # A Label-Studio-style oriented box (4-corner rotated quad + rotation) imported
+    # to L2 must KEEP its quad + angle — the bug collapsed it to an axis envelope,
+    # silently dropping the rotation that only the LS export carries.
+    quad = [10.0, 0.0, 20.0, 10.0, 10.0, 20.0, 0.0, 10.0]  # a 45°-ish diamond
+    src = {"segmentation": [quad], "bbox": [0.0, 0.0, 20.0, 20.0], "area": 200.0, "rotation": 45.0}
+    out = PyQtAnnotationReview._convert_source_annotation(src, 2, "high_vegetation")
+    assert out is not None
+    assert out["rotation"] == 45.0                 # angle preserved
+    assert out["segmentation"][0] == quad          # rotated quad kept, not the envelope
+    assert out["area"] == 200.0
+
+
+def test_convert_collapses_real_polygon_to_box_envelope() -> None:
+    # A genuine polygon (>4 points) remapped to the box level still becomes its
+    # axis-aligned envelope (the polygon-to-box coercion path is unchanged).
+    poly = [0.0, 0.0, 10.0, 0.0, 10.0, 4.0, 5.0, 6.0, 0.0, 4.0]  # 5 points
+    src = {"segmentation": [poly], "bbox": [0.0, 0.0, 10.0, 6.0], "area": 50.0}
+    out = PyQtAnnotationReview._convert_source_annotation(src, 2, "high_vegetation")
+    assert out is not None
+    assert out["rotation"] == 0.0
+    assert out["segmentation"][0] == [0.0, 0.0, 10.0, 0.0, 10.0, 6.0, 0.0, 6.0]  # envelope quad
+
+
 def _routed_project_window(window, parent, src):
     """A project with one image carrying an L1 polygon + an L2 box; return (project, basename)."""
     project, basename = _project_with_image(window, parent, src)
@@ -1023,6 +1190,42 @@ def test_per_level_dirty_tracking_on_project() -> None:
         window._save_all_levels()
         assert window._dirty_levels == set()
         assert window._dirty is False
+
+
+def test_status_shows_saved_confirmation_after_save() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _routed_project_window(window, parent, src)
+        window._set_mode("validation")
+        window._set_level(1)
+
+        # A fresh session hasn't saved yet -> no save-state tail.
+        assert window._last_saved_at is None
+        assert window._save_state_suffix() == ""
+
+        # An edit marks the level dirty -> the unsaved marker takes precedence.
+        window.canvas._set_selected(window._current_level_annotations()[0])
+        window._delete_selected_annotation()
+        assert "unsaved" in window._save_state_suffix()
+
+        # Saving funnels through _write_level_file, stamping _last_saved_at; the tail
+        # flips to the saved confirmation.
+        window._save_dataset()
+        assert window._last_saved_at is not None
+        suffix = window._save_state_suffix()
+        assert "saved" in suffix and "unsaved" not in suffix
+
+
+def test_export_zip_button_visibility_follows_project() -> None:
+    window = _window()
+    assert window.export_zip_button.isHidden() is True  # hidden on the welcome screen
+    with tempfile.TemporaryDirectory() as parent:
+        project = Project.create(parent, "Exp", image_size=STUB_SIZE)
+        window._activate_project(project)
+        assert window.export_zip_button.isHidden() is False  # visible with a project open
+        window._confirm_discard_unsaved = lambda *a, **k: True  # type: ignore[assignment]
+        window._close_project()
+        assert window.export_zip_button.isHidden() is True
 
 
 def test_warn_on_unsaved_save_discard_cancel() -> None:
