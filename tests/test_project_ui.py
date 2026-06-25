@@ -27,16 +27,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PyQt6.QtWidgets import QApplication
 
 from src import levels
+from src.constants import APP_NAME, APP_VERSION
 from src.project import Project
-from src.qt_main import PyQtAnnotationReview
+from src.qt_main import (
+    ClassBubbleButton,
+    CollapsibleClassGroup,
+    KeyCapButton,
+    ObjectRowButton,
+    PyQtAnnotationReview,
+    RedefineDialog,
+)
+
+BASE_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 STUB_SIZE = lambda _path: (640, 480)  # noqa: E731
 
 
-def _make_image(folder: Path, name: str) -> None:
+def _make_image(folder: Path, name: str, size: int = 4) -> None:
     # A real, decodable image so the window's QPixmap loader keeps it (validation
-    # mode discards images it can't decode).
-    image = QImage(4, 4, QImage.Format.Format_RGB32)
+    # mode discards images it can't decode). ``size`` defaults to a tiny 4x4; box
+    # editing tests pass a bigger one so geometry isn't clamped to the image edge.
+    image = QImage(size, size, QImage.Format.Format_RGB32)
     image.fill(0xFF4080A0)
     assert image.save(str(folder / name)), f"could not write {name}"
 
@@ -57,7 +68,7 @@ def test_starts_on_welcome_screen() -> None:
     assert window.project is None
     assert window.import_menu.isEnabled() is False
     assert window.action_close_project.isEnabled() is False
-    assert window.windowTitle() == "Annotation Workbench"
+    assert window.windowTitle() == BASE_TITLE
 
 
 def test_welcome_screen_help_link_opens_workflow() -> None:
@@ -212,12 +223,12 @@ def test_close_project_returns_to_welcome() -> None:
         window._close_project()
         assert window.project is None
         assert window.view_stack.currentIndex() == 0
-        assert window.windowTitle() == "Annotation Workbench"
+        assert window.windowTitle() == BASE_TITLE
 
 
-def _project_with_image(window, parent, src, basename="scene_000000001.png"):
+def _project_with_image(window, parent, src, basename="scene_000000001.png", size=4):
     """Create + activate a project containing one real image; return (project, basename)."""
-    _make_image(Path(src), basename)
+    _make_image(Path(src), basename, size)
     project = Project.create(parent, "Route", image_size=STUB_SIZE)
     window._activate_project(project)
     project.import_images(src)
@@ -540,6 +551,25 @@ def test_image_selector_items_are_numbered() -> None:
         assert "scene_000000001.png" in joined and "scene_000000002.png" in joined
 
 
+def test_images_shown_in_windows_natural_order() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        # Codes chosen to distinguish natural from plain sort: "3SAEE" vs "21SRW".
+        # Windows Explorer (natural) order puts 3SAEE before 21SRW (3 < 21); a plain
+        # string sort would do the opposite ('2' < '3').
+        _make_image(Path(src), "21SRW.png")
+        _make_image(Path(src), "3SAEE.png")
+        project = Project.create(parent, "Order", image_size=STUB_SIZE)
+        window._activate_project(project)
+        project.import_images(src)
+        window._apply_project_session(reset_index=False)
+        order = [os.path.basename(rec["file_name"]) for rec in window.images]
+        assert order == ["3SAEE.png", "21SRW.png"], order
+        # The selector follows the same order.
+        texts = [window.image_selector.itemText(i) for i in range(window.image_selector.count())]
+        assert "3SAEE.png" in texts[0] and "21SRW.png" in texts[1]
+
+
 def test_image_selector_amber_flags_images_with_an_empty_level() -> None:
     from src.qt_main import RedefineRowDelegate
 
@@ -671,9 +701,10 @@ def test_vertex_handles_are_selected_object_only() -> None:
 class _FakeMouse:
     """Minimal stand-in for QMouseEvent for headless press/move/release tests."""
 
-    def __init__(self, x: float, y: float, button) -> None:
+    def __init__(self, x: float, y: float, button, modifiers=Qt.KeyboardModifier.NoModifier) -> None:
         self._p = QPointF(x, y)
         self._b = button
+        self._m = modifiers
 
     def button(self):
         return self._b
@@ -685,7 +716,7 @@ class _FakeMouse:
         return self._p
 
     def modifiers(self):
-        return Qt.KeyboardModifier.NoModifier
+        return self._m
 
 
 def test_pending_polygon_point_move_select_delete_insert() -> None:
@@ -809,7 +840,8 @@ def test_rotate_selected_l2_box_drag_and_undo() -> None:
 
     window = _window()
     with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
-        _project, basename = _project_with_image(window, parent, src)
+        # 64px image so the box + its rotation stay inside it (the corner clamp).
+        _project, basename = _project_with_image(window, parent, src, size=64)
         window._set_mode("annotation")
         window._set_level(2)  # L2 = rotated boxes
         canvas = window.canvas
@@ -914,7 +946,8 @@ def test_rotated_box_vertex_drag_stays_rectangular() -> None:
 def test_move_whole_l2_box_drag_and_undo() -> None:
     window = _window()
     with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
-        _project, basename = _project_with_image(window, parent, src)
+        # 64px image so a 10x10 box can move +3/+2 without hitting the edge clamp.
+        _project, basename = _project_with_image(window, parent, src, size=64)
         window._set_mode("annotation")
         window._set_level(2)  # L2 boxes are movable whole
         canvas = window.canvas
@@ -952,6 +985,148 @@ def test_move_whole_l2_box_drag_and_undo() -> None:
         canvas.mouseReleaseEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
 
 
+def test_box_move_is_clamped_to_image_bounds() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=20)
+        window._set_mode("annotation")
+        window._set_level(2)
+        canvas = window.canvas
+        ann = {"category_id": 1, "bbox": [2, 2, 6, 6], "area": 36, "rotation": 0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        canvas.set_edit_enabled(True)
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # Press the body, then drag WAY past the bottom-right corner of a 20px image.
+        canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is not None
+        canvas.mouseMoveEvent(_FakeMouse(ix + 999 * z, iy + 999 * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 999 * z, iy + 999 * z, Qt.MouseButton.LeftButton))
+        x, y, w, h = ann["bbox"]
+        assert abs(w - 6) < 1e-6 and abs(h - 6) < 1e-6   # size preserved
+        # No corner left the image: it slid to the far edge, not past it.
+        assert -0.5 <= x and x + w <= 20.5 and -0.5 <= y and y + h <= 20.5
+        assert abs(x - 14) < 1e-6 and abs(y - 14) < 1e-6  # pinned at the far corner
+
+
+def test_box_rotation_rejected_when_a_corner_would_leave_image() -> None:
+    from PyQt6.QtCore import QPointF
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=20)
+        window._set_mode("annotation")
+        window._set_level(2)
+        canvas = window.canvas
+        # A wide, thin box hugging the top edge: a 90° turn would swing corners to y<0.
+        ann = {"category_id": 1, "bbox": [0, 0, 18, 2], "area": 36, "rotation": 0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        canvas.set_edit_enabled(True)
+        canvas._set_selected(ann)
+        item = canvas._selected_overlay_item()
+        cx, cy = item["center"]
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # Start to the right of centre (angle 0), drag straight down (would be +90°).
+        canvas._begin_rotation(item, QPointF(ix + (cx + 5) * z, iy + cy * z))
+        canvas._apply_rotation(QPointF(ix + cx * z, iy + (cy + 5) * z))
+        # The out-of-bounds turn was rejected: box unchanged, every corner in bounds.
+        assert ann["rotation"] == 0
+        assert canvas._corners_in_bounds(item["points"], 20, 20)
+
+
+def test_box_edge_resize_moves_one_side_and_undoes() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        window._set_mode("annotation")
+        window._set_level(2)
+        canvas = window.canvas
+        ann = {"category_id": 1, "bbox": [10, 10, 20, 20], "area": 400, "rotation": 0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        window.edit_objects_button.setChecked(True)
+        canvas._set_selected(ann)
+        item = canvas._selected_overlay_item()
+        assert item is not None
+
+        mids = canvas._box_edge_midpoints(item)
+        assert abs(mids[0][0] - 20) < 1e-6 and abs(mids[0][1] - 10) < 1e-6  # top-edge midpoint
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # Grab ONLY the top edge and drag it up; left/right/bottom must stay put.
+        canvas.mousePressEvent(_FakeMouse(ix + 20 * z, iy + 10 * z, Qt.MouseButton.LeftButton))
+        assert canvas._drag_edge is not None and canvas._drag_edge[1] == 0
+        canvas.mouseMoveEvent(_FakeMouse(ix + 20 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 20 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas._drag_edge is None
+        x, y, w, h = ann["bbox"]
+        assert abs(x - 10) < 1e-6 and abs(w - 20) < 1e-6   # left/right unchanged
+        assert abs(y - 5) < 1e-6 and abs(h - 25) < 1e-6     # only the top moved up
+
+        window._undo()  # one-side resize is undoable (geometry snapshot)
+        assert ann["bbox"] == [10, 10, 20, 20]
+
+
+def test_rotated_box_edge_resize_grabs_anywhere_along_edge() -> None:
+    import math
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        window._set_mode("annotation")
+        window._set_level(2)
+        canvas = window.canvas
+        cx, cy = 32.0, 32.0
+        theta = math.radians(30)
+        ct, st = math.cos(theta), math.sin(theta)
+
+        def rot(px, py):
+            dx, dy = px - cx, py - cy
+            return (cx + dx * ct - dy * st, cy + dx * st + dy * ct)
+
+        quad = [rot(20, 26), rot(44, 26), rot(44, 38), rot(20, 38)]
+        ann = {"category_id": 1, "segmentation": [[v for p in quad for v in p]],
+               "bbox": [20, 26, 24, 12], "area": 288, "rotation": 30.0}
+        window.annotation_store[2].setdefault(basename, []).append(ann)
+        window._refresh_overlay_items()
+        window.edit_objects_button.setChecked(True)
+        canvas._set_selected(ann)
+        item = canvas._selected_overlay_item()
+        pts = item["points"]
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        # A point 25% along edge 1 (P1->P2) — NOT the midpoint dot — must still grab it.
+        e = 1
+        gx = pts[e][0] + 0.25 * (pts[(e + 1) % 4][0] - pts[e][0])
+        gy = pts[e][1] + 0.25 * (pts[(e + 1) % 4][1] - pts[e][1])
+        hit = canvas._hit_test_box_edge(QPointF(ix + gx * z, iy + gy * z))
+        assert hit is not None and hit[1] == e  # grabbed along the slanted edge
+
+        # Drag it outward along the edge's perpendicular and confirm a real resize.
+        af = pts[(e + 3) % 4]
+        nx, ny = pts[e][0] - af[0], pts[e][1] - af[1]
+        nl = math.hypot(nx, ny)
+        ux, uy = nx / nl, ny / nl
+        before_area = ann["area"]
+        canvas.mousePressEvent(_FakeMouse(ix + gx * z, iy + gy * z, Qt.MouseButton.LeftButton))
+        assert canvas._drag_edge is not None and canvas._drag_edge[1] == e
+        canvas.mouseMoveEvent(_FakeMouse(ix + (gx + ux * 5) * z, iy + (gy + uy * 5) * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + (gx + ux * 5) * z, iy + (gy + uy * 5) * z, Qt.MouseButton.LeftButton))
+        assert ann["area"] > before_area + 1     # it grew
+        assert abs(ann["rotation"] - 30.0) < 1e-6  # rotation preserved
+        # still a true rectangle (right angle at corner 1)
+        q = ann["segmentation"][0]
+        P = [(q[i], q[i + 1]) for i in range(0, 8, 2)]
+        e01 = (P[1][0] - P[0][0], P[1][1] - P[0][1])
+        e12 = (P[2][0] - P[1][0], P[2][1] - P[1][1])
+        assert abs(e01[0] * e12[0] + e01[1] * e12[1]) < 1e-3
+
+
 def test_reclassify_selected_object_is_undoable() -> None:
     from src import levels
 
@@ -968,6 +1143,8 @@ def test_reclassify_selected_object_is_undoable() -> None:
         window.annotation_store[3].setdefault(basename, []).append(ann)
         window._refresh_overlay_items()
 
+        # Change-class is an Edit-mode operation now.
+        window.edit_objects_button.setChecked(True)
         # Selecting the object swaps the sidebar to the change-class catalog.
         window.canvas._set_selected(ann)
         assert window._redefine_panel_active is True
@@ -1193,6 +1370,7 @@ def test_validation_delete_selected_annotation_on_project() -> None:
         window._set_level(1)
         assert window.delete_button.isHidden() is False  # red ✕ available in validation
 
+        window.edit_objects_button.setChecked(True)  # delete is an Edit-mode op now
         anns = window._current_level_annotations()
         assert len(anns) == 1
         window.canvas._set_selected(anns[0])  # simulate clicking the object body
@@ -1228,6 +1406,7 @@ def test_per_level_dirty_tracking_on_project() -> None:
     with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
         _routed_project_window(window, parent, src)  # L1 polygon + L2 box
         window._set_mode("validation")
+        window.edit_objects_button.setChecked(True)  # delete is an Edit-mode op now
         assert window.action_export_zip.isEnabled() is True
 
         window._set_level(1)
@@ -1264,6 +1443,7 @@ def test_status_shows_saved_confirmation_after_save() -> None:
         assert window._save_state_suffix() == ""
 
         # An edit marks the level dirty -> the unsaved marker takes precedence.
+        window.edit_objects_button.setChecked(True)  # delete is an Edit-mode op now
         window.canvas._set_selected(window._current_level_annotations()[0])
         window._delete_selected_annotation()
         assert "unsaved" in window._save_state_suffix()
@@ -1295,6 +1475,7 @@ def test_warn_on_unsaved_save_discard_cancel() -> None:
         project, basename = _routed_project_window(window, parent, src)
         window._set_mode("validation")
         window._set_level(1)
+        window.edit_objects_button.setChecked(True)  # delete is an Edit-mode op now
         window.canvas._set_selected(window._current_level_annotations()[0])
         window._delete_selected_annotation()
         assert window._dirty is True
@@ -1350,6 +1531,39 @@ def test_redefine_object_selectable_and_reclassified_per_object() -> None:
         assert window._redefine_panel_active is False  # normal sidebar restored
 
 
+def test_redefine_resolve_is_undoable() -> None:
+    from src import levels
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        project, basename = _project_with_image(window, parent, src)
+        images = [{"id": 1, "file_name": basename}]
+        ann = {"category_id": 9, "segmentation": [[0, 0, 6, 0, 6, 6, 0, 6]], "bbox": [0, 0, 6, 6], "area": 36}
+        window._route_and_commit_annotations(images, {1: [ann]}, {9: "banana"})  # off-catalog -> stashed
+        assert project.unmapped_class_counts() == {"banana": 1}
+        window._set_mode("annotation")
+        window._set_level(1)
+        overlay = next(o for o in window.current_overlay_items if o.get("pending_redefine"))
+        entry_id = overlay["redefine_entry_id"]
+
+        # Resolve -> object committed to L1 on disk, stash empty.
+        window._resolve_redefine_object(entry_id, "road_asphalt")
+        cat = levels.category_id_for_class(1, "road_asphalt")
+        assert [a["category_id"] for a in project.read_level(1).get(basename, [])] == [cat]
+        assert project.unmapped_class_counts() == {}
+
+        # Undo -> object removed (re-persisted), stash entry restored, overlay back.
+        window._undo()
+        assert project.read_level(1).get(basename, []) == []
+        assert project.unmapped_class_counts() == {"banana": 1}
+        assert len([o for o in window.current_overlay_items if o.get("pending_redefine")]) == 1
+
+        # Redo -> object re-committed, stash empty again.
+        window._redo()
+        assert [a["category_id"] for a in project.read_level(1).get(basename, [])] == [cat]
+        assert project.unmapped_class_counts() == {}
+
+
 def test_redefine_overlay_matches_image_by_stable_id_across_prefix() -> None:
     # Regression: a real export references the SAME photo under a different filename
     # prefix than the project's stored copy. The red row flag matched by stable id,
@@ -1390,11 +1604,666 @@ def test_image_id_badge_shows_current_image_id() -> None:
         _project, basename = _project_with_image(window, parent, src)  # scene_000000001.png
         window._update_status_labels()
         expected = os.path.splitext(basename)[0][-9:]  # the Copy ID value
-        assert window.image_id_label.text() == expected
+        # The title badge shows the image position then the id (e.g. "1/1 - …id"); the
+        # bare id is still what _current_image_id_text / Copy ID hand out.
+        assert window.image_id_label.text() == f"1/1 - {expected}"
         assert window._current_image_id_text() == expected
-        # The badge mirrors exactly what Copy ID writes to the clipboard.
+        # The clipboard gets exactly the bare id, never the appended position.
         window._copy_image_id()
         assert QApplication.clipboard().text() == expected
+
+
+def _l1_class():
+    """First L1 (polygon) class as (name, category_id)."""
+    name = levels.level_classes(1)[0][0]
+    return name, levels.category_id_for_class(1, name)
+
+
+def _poly_ann(category_id, pts):
+    """A polygon annotation dict from a flat point list (image coords)."""
+    xs, ys = pts[0::2], pts[1::2]
+    return {
+        "category_id": category_id,
+        "segmentation": [list(pts)],
+        "bbox": [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)],
+        "area": 9,
+        "iscrowd": 0,
+    }
+
+
+def test_version_shown_in_title_and_welcome() -> None:
+    from PyQt6.QtWidgets import QLabel
+
+    window = _window()
+    # Welcome screen advertises the version.
+    welcome_text = " ".join(lbl.text() for lbl in window.welcome_page.findChildren(QLabel))
+    assert APP_VERSION in welcome_text
+    with tempfile.TemporaryDirectory() as parent:
+        project = Project.create(parent, "Ver", image_size=STUB_SIZE)
+        window._activate_project(project)
+        # Title carries the app name + version alongside the project name.
+        assert APP_NAME in window.windowTitle() and APP_VERSION in window.windowTitle()
+        # The sidebar subtitle shows the open project's name (styled "PROJECT — name").
+        subtitle = window.subtitle_label.text()
+        assert "Ver" in subtitle and "PROJECT" in subtitle
+
+
+def test_class_rollout_lists_objects_and_per_object_visibility() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        anns = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3]), _poly_ann(cid, [0, 0, 2, 0, 2, 2, 0, 2])]
+        window.annotation_store[1][basename] = list(anns)
+        window._set_mode("validation")
+        window._set_level(1)
+
+        # One expandable class bubble (the class IS present on the image).
+        bubbles = window.class_list_container.findChildren(ClassBubbleButton)
+        assert len(bubbles) == 1 and bubbles[0].category_id == cid
+
+        # Expand it -> one row per object.
+        window._on_class_expand_toggled(cid, True)
+        assert len(window.class_list_container.findChildren(ObjectRowButton)) == 2
+
+        # Both objects render initially.
+        shown = [o for o in window.current_overlay_items if o.get("annotation") is not None]
+        assert len(shown) == 2
+
+        # Plain click on the first object's row hides ONLY that object.
+        window._on_object_row_activated(anns[0], shift=False)
+        shown = [o for o in window.current_overlay_items if o.get("annotation") is not None]
+        assert len(shown) == 1 and shown[0]["annotation"] is anns[1]
+
+        # Clicking again un-hides it.
+        window._on_object_row_activated(anns[0], shift=False)
+        assert len([o for o in window.current_overlay_items if o.get("annotation") is not None]) == 2
+
+        # Shift-click selects the object on the canvas (as if clicked in the image).
+        window._on_object_row_activated(anns[1], shift=True)
+        assert window.canvas.selected_annotation() is anns[1]
+
+
+def test_expand_arrows_are_parented_not_floating_windows() -> None:
+    # Regression: the disclosure arrow was created parentless and made visible
+    # before being added to a layout, so it flashed as a tiny top-level window
+    # (close/max frame) in the middle of the canvas ~10x per class-list rebuild.
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+        bubbles = window.class_list_container.findChildren(ClassBubbleButton)
+        assert bubbles  # full catalog is listed in annotation mode
+        for bubble in bubbles:
+            assert bubble._expand_btn.parent() is not None
+            assert bubble._expand_btn.isWindow() is False
+            assert bubble._expand_btn.isVisible() in (True, False)  # never floats as a window
+
+
+def test_rollout_works_in_annotation_mode_too() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        window.annotation_store[1][basename] = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])]
+        window._set_mode("annotation")
+        window._set_level(1)
+        # The class catalog bubble for our class is expandable (it has an object).
+        bubble = next(b for b in window.class_list_container.findChildren(ClassBubbleButton) if b.category_id == cid)
+        assert bubble._expand_btn.isVisible() in (True, False)  # widget exists
+        window._on_class_expand_toggled(cid, True)
+        assert len(window.class_list_container.findChildren(ObjectRowButton)) == 1
+
+
+def test_annotation_pill_toggles_class_visibility_with_pen_up() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        window.annotation_store[1][basename] = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])]
+        window._set_mode("annotation")
+        window._set_level(1)
+        assert window.draw_button.isChecked() is False
+        assert window.class_action_widget.isHidden() is False  # show/hide-all available pen-up
+        assert any(it.get("annotation") for it in window.current_overlay_items)
+
+        bubble = next(b for b in window.class_list_container.findChildren(ClassBubbleButton) if b.category_id == cid)
+        # Pen UP: clicking the pill HIDES the class (visibility toggle); it does NOT
+        # become the active draw class, and its objects leave the canvas.
+        bubble.toggled.emit(False)
+        assert window.visible_by_category.get(cid) is False
+        assert window.active_category_by_level.get(1) is None
+        assert not any(it.get("annotation") for it in window.current_overlay_items)
+
+        # Show all brings it back.
+        window._show_all_classes()
+        assert window.visible_by_category.get(cid) is True
+        assert any(it.get("annotation") for it in window.current_overlay_items)
+
+
+def test_annotation_pill_selects_draw_class_with_pen_down() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        window.annotation_store[1][basename] = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])]
+        window._set_mode("annotation")
+        window._set_level(1)
+        window.draw_button.setChecked(True)  # pen down
+        assert window.class_action_widget.isHidden() is True  # show/hide-all hidden while drawing
+
+        bubble = next(b for b in window.class_list_container.findChildren(ClassBubbleButton) if b.category_id == cid)
+        bubble.toggled.emit(True)
+        # Pen DOWN: the pill picks the active draw class; the class stays visible.
+        assert window.active_category_by_level.get(1) == cid
+        assert window.visible_by_category.get(cid, True) is True
+        assert any(it.get("annotation") for it in window.current_overlay_items)
+
+
+def test_change_class_panel_uses_framed_class_pills() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _p, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])
+        window.annotation_store[1][basename] = [ann]
+        window._set_mode("annotation")
+        window._set_level(1)
+        window.edit_objects_button.setChecked(True)
+        window.canvas._set_selected(ann)  # -> change-class catalog panel
+        # The picker now uses the SAME framed class pills as the main list (not the
+        # separate collapsible-group look), so it's visually consistent.
+        bubbles = window.class_list_container.findChildren(ClassBubbleButton)
+        assert bubbles, "the change-class panel should use the framed class pills"
+        assert not window.class_list_container.findChildren(CollapsibleClassGroup)
+        # Clicking a pill reclassifies the selected object to that class.
+        target_name = levels.level_classes(1)[3][0]
+        target_cid = levels.category_id_for_class(1, target_name)
+        target = next(b for b in bubbles if b.category_id == target_cid)
+        target.toggled.emit(False)  # a pill click fires the catalog pick
+        assert ann["category_id"] == target_cid
+
+
+def test_redefine_dialog_collects_remaps_and_parks() -> None:
+    window = _window()
+    dialog = RedefineDialog(window, {"weird_a": 3, "weird_b": 1})
+    picker_a = next(p for p in dialog._pickers if p.raw_class == "weird_a")
+    picker_b = next(p for p in dialog._pickers if p.raw_class == "weird_b")
+    # weird_a -> full remap into L1's first class; weird_b -> parked in L2 (no class).
+    l1_name = levels.level_classes(1)[0][0]
+    picker_a._choose_level(1)
+    picker_a._choose_target(l1_name)
+    picker_b._choose_level(2)  # level chosen, no class picked = park
+    assert dialog.mappings() == {"weird_a": (1, l1_name)}
+    assert dialog.level_only() == {"weird_b": 2}
+    dialog.deleteLater()
+
+
+def test_redefine_dialog_preselects_parked_level() -> None:
+    window = _window()
+    # A class previously parked in L3 reopens with that level pre-chosen (park state).
+    dialog = RedefineDialog(window, {"weird": 2}, {"weird": 3})
+    picker = dialog._pickers[0]
+    assert picker.choice() == ("park", 3)
+    assert dialog.level_only() == {"weird": 3}
+    assert dialog.mappings() == {}
+    dialog.deleteLater()
+
+
+def test_object_rows_dim_when_class_hidden() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        anns = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3]), _poly_ann(cid, [0, 0, 2, 0, 2, 2, 0, 2])]
+        window.annotation_store[1][basename] = list(anns)
+        window._set_mode("validation")
+        window._set_level(1)
+        window._on_class_expand_toggled(cid, True)
+
+        rows = window.class_list_container.findChildren(ObjectRowButton)
+        assert len(rows) == 2 and all(not r._is_dimmed() for r in rows)  # class visible -> bright
+
+        # Hiding the whole class dims every object row under it.
+        window._on_class_toggled(cid, False)
+        assert all(r._is_dimmed() for r in window.class_list_container.findChildren(ObjectRowButton))
+
+        # Showing it again un-dims them.
+        window._on_class_toggled(cid, True)
+        assert all(not r._is_dimmed() for r in window.class_list_container.findChildren(ObjectRowButton))
+
+
+def test_object_row_dims_when_individually_hidden() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        anns = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3]), _poly_ann(cid, [0, 0, 2, 0, 2, 2, 0, 2])]
+        window.annotation_store[1][basename] = list(anns)
+        window._set_mode("validation")
+        window._set_level(1)
+        window._on_class_expand_toggled(cid, True)
+
+        # Toggle the first object's visibility through its row signal (so the row
+        # itself, not just the overlay, reflects the hide).
+        row0 = next(r for r in window.class_list_container.findChildren(ObjectRowButton) if r.annotation is anns[0])
+        row0.activated.emit(anns[0], False)
+
+        rows = {id(r.annotation): r for r in window.class_list_container.findChildren(ObjectRowButton)}
+        assert rows[id(anns[0])]._is_dimmed() is True   # this object hidden -> dim
+        assert rows[id(anns[1])]._is_dimmed() is False  # its sibling stays bright
+
+
+def test_default_shortcuts_only_undo_redo_save_enabled() -> None:
+    window = _window()
+    # Out of the box only Undo / Redo / Save have keys; everything else is unbound.
+    enabled = {aid for aid in window.shortcut_order() if window.shortcut_primary(aid)}
+    assert enabled == {"undo", "redo", "save"}
+    # The live dispatch index resolves only those actions (redo's reserved alias too).
+    assert set(window._shortcut_index.values()) == {"undo", "redo", "save"}
+    assert window._shortcut_index.get("Ctrl+Z") == "undo"
+    assert window._shortcut_index.get("Ctrl+S") == "save"
+
+
+def test_clear_shortcut_disables_and_rebind_reenables() -> None:
+    window = _window()
+    window._save_shortcuts = lambda: None  # don't touch the real on-disk config
+    assert window._shortcut_index.get("Ctrl+S") == "save"
+
+    window.clear_shortcut("save")
+    assert window.shortcut_primary("save") == ""
+    assert "Ctrl+S" not in window._shortcut_index  # cleared -> disabled
+
+    # The same (or any) key can be reassigned afterwards to re-enable it.
+    ok, _msg = window.try_rebind_shortcut("save", "Ctrl+S")
+    assert ok is True
+    assert window._shortcut_index.get("Ctrl+S") == "save"
+
+
+def test_no_fixed_alias_shortcuts_remain() -> None:
+    window = _window()
+    window._save_shortcuts = lambda: None
+    # The old reserved aliases are gone: nothing has an alias, and Space / Return /
+    # Enter / Shift+Space / Ctrl+Shift+Z resolve to no action.
+    assert all(window.shortcut_alias_text(aid) == "" for aid in window.shortcut_order())
+    for key in ("Space", "Return", "Enter", "Shift+Space", "Ctrl+Shift+Z"):
+        assert key not in window._shortcut_index
+
+    # Assigning a key enables exactly that one key — no alias tags along.
+    ok, _msg = window.try_rebind_shortcut("next_image", "N")
+    assert ok is True
+    assert window._shortcut_index.get("N") == "next_image"
+    assert "Space" not in window._shortcut_index
+
+
+def test_space_swallower_eats_button_space_but_not_capture() -> None:
+    from PyQt6.QtWidgets import QCheckBox, QPushButton
+
+    from src.qt_main import _ButtonSpaceSwallower
+
+    assert _ButtonSpaceSwallower._should_swallow(QPushButton("x")) is True
+    assert _ButtonSpaceSwallower._should_swallow(QCheckBox("x")) is False  # checkboxes keep Space
+    assert _ButtonSpaceSwallower._should_swallow(None) is False
+
+    cap = KeyCapButton("")
+    assert _ButtonSpaceSwallower._should_swallow(cap) is True  # not capturing -> swallow
+    cap.set_listening(True)
+    assert _ButtonSpaceSwallower._should_swallow(cap) is False  # capturing a key needs Space
+
+
+def test_hiding_all_objects_dims_class_and_clicking_class_restores() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        anns = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3]), _poly_ann(cid, [0, 0, 2, 0, 2, 2, 0, 2])]
+        window.annotation_store[1][basename] = list(anns)
+        window._set_mode("validation")
+        window._set_level(1)
+        window._on_class_expand_toggled(cid, True)
+        bubble = window.class_checkboxes[cid]
+
+        # Hide each object individually; once the LAST one is hidden the class dims.
+        for row in list(window.class_list_container.findChildren(ObjectRowButton)):
+            row.activated.emit(row.annotation, False)
+        assert window.visible_by_category[cid] is False     # class auto-dimmed
+        assert bubble.isChecked() is False
+        assert window.current_overlay_items == []           # nothing is visible
+
+        # Clicking the class brings every object back in a single click.
+        bubble.setChecked(True)  # emits toggled -> _on_class_toggled(cid, True)
+        assert window.visible_by_category[cid] is True
+        assert len([o for o in window.current_overlay_items if o.get("annotation") is not None]) == 2
+        assert all(not r._is_dimmed() for r in window.class_list_container.findChildren(ObjectRowButton))
+
+
+def test_clicking_one_object_while_class_hidden_isolates_it() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        anns = [
+            _poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3]),
+            _poly_ann(cid, [0, 0, 2, 0, 2, 2, 0, 2]),
+            _poly_ann(cid, [0, 0, 1, 0, 1, 1, 0, 1]),
+        ]
+        window.annotation_store[1][basename] = list(anns)
+        window._set_mode("validation")
+        window._set_level(1)
+        window._on_class_expand_toggled(cid, True)
+        bubble = window.class_checkboxes[cid]
+
+        # Hide the whole class via its pill — this path leaves _hidden_objects EMPTY
+        # (the regression: a plain object toggle would then hide the clicked one and
+        # reveal all the others).
+        window._on_class_toggled(cid, False)
+        assert window.current_overlay_items == []
+
+        # Click one object row -> ONLY that object shows, and the class re-lights.
+        target = anns[0]
+        rows = {id(r.annotation): r for r in window.class_list_container.findChildren(ObjectRowButton)}
+        rows[id(target)].activated.emit(target, False)
+
+        shown = [o["annotation"] for o in window.current_overlay_items if o.get("annotation") is not None]
+        assert shown == [target]                        # only the clicked object, not the others
+        assert window.visible_by_category[cid] is True  # class on (>=1 object visible)
+        assert bubble.isChecked() is True
+        rows = {id(r.annotation): r for r in window.class_list_container.findChildren(ObjectRowButton)}
+        assert rows[id(target)]._is_dimmed() is False
+        assert all(rows[id(a)]._is_dimmed() for a in anns[1:])  # the rest stay dimmed/hidden
+
+
+def test_class_visibility_resets_on_image_navigation() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        src_path = Path(src)
+        _make_image(src_path, "scene_000000001.png")
+        _make_image(src_path, "scene_000000002.png")
+        project = Project.create(parent, "Nav", image_size=STUB_SIZE)
+        window._activate_project(project)
+        project.import_images(src)
+        project.promote_pending()
+        window._apply_project_session(reset_index=False)
+        assert len(window.images) == 2
+
+        name, cid = _l1_class()
+        window.annotation_store[1]["scene_000000001.png"] = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])]
+        window.annotation_store[1]["scene_000000002.png"] = [_poly_ann(cid, [0, 0, 2, 0, 2, 2, 0, 2])]
+        window._set_mode("validation")
+        window._set_level(1)
+        window.index = 0
+        window._load_current_image(reset_fit=False)
+
+        # Hide the class on image 1.
+        window._on_class_toggled(cid, False)
+        assert window.visible_by_category.get(cid) is False
+        assert window.current_overlay_items == []
+
+        # Next image -> class visibility resets (pill visible again, object shows).
+        window._next_image()
+        assert window.visible_by_category.get(cid, True) is True
+        assert window.class_checkboxes[cid].isChecked() is True
+        assert [o["label"] for o in window.current_overlay_items if o.get("annotation") is not None] == [name]
+
+        # Hide it again here, then go back -> image 1 is reset too (not still hidden).
+        window._on_class_toggled(cid, False)
+        window._prev_image()
+        assert window.visible_by_category.get(cid, True) is True
+        assert window.class_checkboxes[cid].isChecked() is True
+        assert [o["label"] for o in window.current_overlay_items if o.get("annotation") is not None] == [name]
+
+
+def test_keycap_shows_placeholder_when_unbound() -> None:
+    cap = KeyCapButton("")
+    assert cap.text() == KeyCapButton.UNBOUND_TEXT  # empty binding -> placeholder
+    cap.set_binding_text("N")
+    assert cap.text() == "N"
+    cap.set_binding_text("")
+    assert cap.text() == KeyCapButton.UNBOUND_TEXT
+
+
+def test_select_outside_edit_is_non_destructive_with_row_highlight() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])
+        window.annotation_store[1][basename] = [ann]
+        window._set_mode("validation")
+        window._set_level(1)
+
+        # Outside Edit mode: selecting is non-destructive — the list stays (no
+        # change-class panel), Delete is disabled, and a no-op.
+        assert window.edit_objects_button.isChecked() is False
+        window.canvas._set_selected(ann)
+        assert window._redefine_panel_active is False
+        assert window.delete_button.isEnabled() is False
+        rows = [r for r in window.class_list_container.findChildren(ObjectRowButton) if r.annotation is ann]
+        assert len(rows) == 1 and rows[0]._selected is True  # class auto-expanded + row highlighted
+        assert window._delete_selected_annotation() is False  # delete gated to Edit mode
+        assert window._current_level_annotations() == [ann]
+
+        # Turn Edit on: now selection offers change-class + Delete works.
+        window.edit_objects_button.setChecked(True)
+        assert window._redefine_panel_active is True
+        assert window.delete_button.isEnabled() is True
+        assert window._delete_selected_annotation() is True
+        assert window._current_level_annotations() == []
+
+
+def _render_overlays(canvas) -> None:
+    from PyQt6.QtGui import QPainter
+
+    img = QImage(max(1, canvas.width()), max(1, canvas.height()), QImage.Format.Format_ARGB32)
+    img.fill(0)
+    painter = QPainter(img)
+    ix, iy, _w, _h = canvas._fit_display_rect()
+    canvas._draw_overlays(painter, ix, iy)
+    painter.end()
+
+
+def test_label_shift_drag_repositions_and_selects() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 4, 0, 4, 4, 0, 4])  # fills the 4x4 image
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)
+        canvas = window.canvas
+        canvas.fit_to_view()
+
+        # Painting records the label rectangle so a press can land on it.
+        _render_overlays(canvas)
+        assert canvas._label_hit_rects, "label rect should be recorded for an on-screen object"
+        rect, hit_ann = canvas._label_hit_rects[-1]
+        assert hit_ann is ann
+
+        center = rect.center()
+        shift = Qt.KeyboardModifier.ShiftModifier
+        canvas.mousePressEvent(_FakeMouse(center.x(), center.y(), Qt.MouseButton.LeftButton, shift))
+        assert canvas._label_drag_ann is ann
+        assert canvas.selected_annotation() is ann  # selected/highlighted while dragging
+
+        canvas.mouseMoveEvent(_FakeMouse(center.x() + 20, center.y() + 12, Qt.MouseButton.LeftButton, shift))
+        canvas.mouseReleaseEvent(_FakeMouse(center.x() + 20, center.y() + 12, Qt.MouseButton.LeftButton))
+        assert canvas._label_drag_ann is None
+        off = canvas._label_offsets[id(ann)]
+        # Offsets are stored in IMAGE space now (screen drag / zoom) so the label
+        # keeps its place on the object across zoom; scaling back by the zoom
+        # recovers the 20x12 screen-pixel drag.
+        zoom = canvas._zoom
+        assert abs(off.x() * zoom - 20) < 1.5 and abs(off.y() * zoom - 12) < 1.5
+
+        # Loading a new image clears the (session-only) offsets.
+        canvas._clear_label_offsets()
+        assert canvas._label_offsets == {}
+
+
+def test_label_hidden_when_object_is_off_screen() -> None:
+    from PyQt6.QtCore import QPoint
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 4, 0, 4, 4, 0, 4])
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)
+        canvas = window.canvas
+        canvas.fit_to_view()
+
+        _render_overlays(canvas)
+        assert canvas._label_hit_rects  # visible -> label drawn
+
+        # Pan far away so the object leaves the view entirely.
+        canvas._fit_mode = False
+        canvas._zoom = 40.0
+        canvas._offset = QPoint(12000, 12000)
+        _render_overlays(canvas)
+        assert canvas._label_hit_rects == []  # off-screen -> no label (no edge pile-up)
+
+
+def test_label_kept_inside_image_rectangle() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=40)
+        name, cid = _l1_class()
+        # An object hugging the RIGHT edge — its centred label would naturally spill
+        # past the image into the black area; it must be clamped back inside.
+        ann = _poly_ann(cid, [30, 18, 40, 18, 40, 22, 30, 22])
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)
+        cv = window.canvas
+        cv.resize(400, 400)
+        cv.fit_to_view()
+        _render_overlays(cv)
+        assert cv._label_hit_rects
+        rect, _hit = cv._label_hit_rects[-1]
+        ix, iy, sw, sh = cv._fit_display_rect()
+        # The whole label box sits within the image's displayed rectangle.
+        assert rect.left() >= ix - 1.0 and rect.right() <= ix + sw + 1.0
+        assert rect.top() >= iy - 1.0 and rect.bottom() <= iy + sh + 1.0
+
+
+def test_label_leader_line_drawn_when_dragged_far() -> None:
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QPainter
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=20)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [6, 6, 12, 6, 12, 12, 6, 12])  # centred ~ (9, 9), clear of edges
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)
+        canvas = window.canvas
+        canvas.resize(400, 400)
+        canvas.fit_to_view()
+
+        # Drag the label far from the object (well past the leader threshold).
+        canvas._label_offsets[id(ann)] = QPointF(120.0, 120.0)
+
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        item = next(o for o in canvas._overlay_items if o.get("annotation") is ann)
+        cx, cy = item["center"]
+        acx, acy = ix + cx * canvas._zoom, iy + cy * canvas._zoom  # object anchor on screen
+
+        img = QImage(canvas.width(), canvas.height(), QImage.Format.Format_RGB32)
+        img.fill(0)
+        painter = QPainter(img)
+        canvas._draw_overlays(painter, ix, iy)
+        painter.end()
+
+        rect, _hit = canvas._label_hit_rects[-1]   # the dragged label box
+        lcx, lcy = rect.center().x(), rect.center().y()
+        midx, midy = (acx + lcx) / 2.0, (acy + lcy) / 2.0  # midpoint of the leader line
+        # A pixel on/near the leader is lit (scan a small neighbourhood for robustness).
+        lit = any(
+            0 <= int(midx) + dx < img.width() and 0 <= int(midy) + dy < img.height()
+            and img.pixelColor(int(midx) + dx, int(midy) + dy).value() > 0
+            for dx in range(-2, 3) for dy in range(-2, 3)
+        )
+        assert lit, "expected a leader line between the object and its dragged label"
+
+
+def test_draw_mode_deselects_and_restores_class_list() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])
+        window.annotation_store[1][basename] = [ann]
+        window._set_mode("annotation")
+        window._set_level(1)
+
+        # In Edit mode, selecting the object swaps the sidebar to the change-class panel.
+        window.edit_objects_button.setChecked(True)
+        window.canvas._set_selected(ann)
+        assert window.canvas.selected_annotation() is ann
+        assert window._redefine_panel_active is True
+
+        # Turning on Draw deselects AND restores the normal class list, so the next
+        # class click sets the DRAW class instead of reclassifying the object.
+        window.draw_button.setChecked(True)
+        assert window.canvas.selected_annotation() is None
+        assert window._redefine_panel_active is False
+
+
+def _pump_until(predicate, timeout_ms: int = 4000) -> bool:
+    """Spin the Qt event loop until ``predicate()`` or a timeout (for QThread tests)."""
+    from PyQt6.QtCore import QThread
+
+    app = QApplication.instance()
+    for _ in range(timeout_ms):
+        if predicate():
+            return True
+        app.processEvents()
+        QThread.msleep(1)
+    return predicate()
+
+
+def test_run_in_background_runs_off_ui_thread_and_delivers_on_ui_thread() -> None:
+    import threading
+
+    window = _window()
+    main_thread = threading.get_ident()
+    captured: dict = {}
+
+    def work():
+        captured["work_thread"] = threading.get_ident()
+        return 42
+
+    def done(result, error):
+        captured["done_thread"] = threading.get_ident()
+        captured["result"] = result
+        captured["error"] = error
+
+    assert window._run_in_background("test", work, done) is True
+    # A second task is refused while one is running.
+    assert window._run_in_background("test2", lambda: None, lambda r, e: None) is False
+
+    assert _pump_until(lambda: window._bg_task is None and "result" in captured)
+    assert captured["result"] == 42 and captured["error"] is None
+    assert captured["work_thread"] != main_thread   # work ran OFF the UI thread
+    assert captured["done_thread"] == main_thread    # done ran ON the UI thread
+
+
+def test_run_in_background_reports_worker_errors() -> None:
+    window = _window()
+    captured: dict = {}
+
+    def work():
+        raise RuntimeError("boom")
+
+    def done(result, error):
+        captured["result"] = result
+        captured["error"] = error
+
+    window._run_in_background("test", work, done)
+    assert _pump_until(lambda: window._bg_task is None and "error" in captured)
+    assert isinstance(captured["error"], RuntimeError) and captured["result"] is None
 
 
 def _run_all() -> int:
@@ -1414,6 +2283,14 @@ def _run_all() -> int:
         else:
             print(f"PASS {test.__name__}")
     print(f"\n{len(tests) - failures}/{len(tests)} passed")
+    # Tests never close their windows, so ~80 of them linger as top-level widgets.
+    # Destroy them WHILE the QApplication is still alive: dangling QWidgets left for
+    # Python's interpreter-shutdown GC can segfault under the offscreen platform.
+    # Use deleteLater (NOT close) so we don't trigger any window's closeEvent — that
+    # can pop an unsaved-changes modal or wait on a background task and hang.
+    for widget in list(app.topLevelWidgets()):
+        widget.deleteLater()
+    app.processEvents()
     return 1 if failures else 0
 
 

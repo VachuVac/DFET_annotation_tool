@@ -32,4 +32,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build failed."
 }
 
-Write-Host "Build complete. EXE should be in 'dist\Annotation Workbench\'"
+# One-file build: the whole app is the single exe. Share just this file; the 'build\'
+# folder is throwaway intermediate work and does NOT need to be shared.
+Write-Host ""
+Write-Host "Build complete."
+Write-Host "Share THIS file: dist\Annotation Workbench.exe"

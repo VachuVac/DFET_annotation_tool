@@ -4,6 +4,11 @@ import ctypes
 import os
 
 
+# Application identity / version. Pinned at 1.0 for now; bump here when releasing.
+APP_NAME = "Annotation Workbench"
+APP_VERSION = "1.1"
+
+
 def _detect_monitor_size() -> tuple[int, int]:
 	"""Detect primary monitor size with a safe fallback."""
 	try:

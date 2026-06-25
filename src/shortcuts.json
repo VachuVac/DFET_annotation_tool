@@ -1,10 +1,15 @@
 {
-    "next_image": "N",
-    "prev_image": "P",
-    "reset_view": "R",
+    "next_image": "",
+    "prev_image": "",
+    "reset_view": "",
     "undo": "Ctrl+Z",
     "redo": "Ctrl+Y",
     "save": "Ctrl+S",
-    "open": "O",
-    "quit": "Q"
+    "open": "",
+    "toggle_mode": "",
+    "toggle_draw": "",
+    "toggle_edit": "",
+    "level_1": "",
+    "level_2": "",
+    "level_3": ""
 }

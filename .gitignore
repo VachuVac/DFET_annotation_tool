@@ -1,0 +1,13 @@
+# PyInstaller build output (throwaway intermediate + shareable artifacts)
+build/
+dist/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# OS cruft
+Thumbs.db
+.DS_Store

@@ -394,9 +394,13 @@ class Project:
     def export_zip(self, dest_path: str) -> Path:
         """Bundle the whole project into a single shareable ``.zip``.
 
-        The archive holds the manifest, ``images/`` and the level JSONs under a
-        top-level ``<ProjectName>/`` directory, so unzipping yields a folder that
-        :meth:`open` accepts directly. Returns the written path (``.zip`` enforced).
+        The archive holds the manifest, ``images/`` and the level JSONs at the zip
+        ROOT (no extra ``<ProjectName>/`` wrapper inside). Since the archive itself
+        is named ``<ProjectName>.zip``, extracting it with Windows Explorer — which
+        drops the contents into a folder named after the zip — yields a single
+        ``<ProjectName>/`` folder that :meth:`open` accepts directly, instead of a
+        doubly-nested ``<ProjectName>/<ProjectName>/``. Returns the written path
+        (``.zip`` enforced).
         """
         import zipfile
 
@@ -409,8 +413,8 @@ class Project:
                 for path in sorted(self.root.rglob("*")):
                     # Skip the archive itself if the user wrote it inside the project.
                     if path.is_file() and path.resolve() != dest.resolve():
-                        # as_posix(): zip entries use '/', not the OS separator.
-                        arcname = (Path(self.root.name) / path.relative_to(self.root)).as_posix()
+                        # Entries live at the zip root; as_posix(): zip uses '/'.
+                        arcname = path.relative_to(self.root).as_posix()
                         archive.write(path, arcname)
         except OSError as error:
             raise ProjectError(f"Could not export zip: {error}") from error
@@ -488,6 +492,19 @@ class Project:
         if popped is not None:
             self.write_unmapped(kept)
         return popped
+
+    def restore_unmapped_entry(self, entry: dict) -> None:
+        """Re-insert a previously popped stash entry verbatim (preserving its id).
+
+        Used to UNDO a per-object redefine resolve: the object reappears in the
+        redefine list exactly as it was (same id -> re-resolvable, red row returns).
+        No-op if an entry with that id is already present.
+        """
+        unmapped = self.read_unmapped()
+        if any(e.get("id") == entry.get("id") for e in unmapped):
+            return
+        unmapped.append(dict(entry))
+        self.write_unmapped(unmapped)
 
     def unmapped_class_counts(self) -> dict[str, int]:
         """Distinct unknown class names still awaiting redefinition -> count."""

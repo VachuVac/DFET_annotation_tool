@@ -114,7 +114,7 @@ LEVELS: dict[int, dict] = {
                 ("trailer", "#00FF00"),
             ]),
             ("TRAFFIC ELEMENTS & SIGNAGE", [
-                ("road_marking", "#DCDCDC"),
+                ("road_marking", "#E6FF00"),
                 ("traffic_sign", "#B03060"),
                 ("traffic_light", "#ADFF2F"),
                 ("traffic_cone", "#FF4500"),

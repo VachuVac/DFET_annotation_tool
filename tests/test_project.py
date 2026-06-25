@@ -247,6 +247,13 @@ def test_unmapped_entry_ids_and_pop() -> None:
         assert project.pop_unmapped_entry("nope") is None  # unknown id is a no-op
         assert len(project.read_unmapped()) == 1
 
+        # restore_unmapped_entry re-inserts a popped entry verbatim (undo support).
+        project.restore_unmapped_entry(popped)
+        restored = {entry["id"] for entry in project.read_unmapped()}
+        assert restored == {ids[0], ids[1]}  # the popped one is back, same id
+        project.restore_unmapped_entry(popped)  # idempotent: no duplicate
+        assert len(project.read_unmapped()) == 2
+
 
 def test_export_zip_round_trips() -> None:
     import zipfile
@@ -262,17 +269,19 @@ def test_export_zip_round_trips() -> None:
 
         with zipfile.ZipFile(written) as archive:
             names = archive.namelist()
-        # Everything under a top-level <ProjectName>/ dir, with forward slashes.
-        assert all(name.startswith("Exp/") for name in names), names
-        assert any(name.endswith("project.json") for name in names)
-        assert any(name.endswith("images/scene_000000001.png") for name in names)
-        assert any(name.endswith("annotations/level1.json") for name in names)
+        # Contents live at the zip ROOT (no <ProjectName>/ wrapper), forward slashes.
+        # Extracting <ProjectName>.zip then yields a single openable folder instead
+        # of a doubly-nested one.
+        assert "project.json" in names, names
+        assert "images/scene_000000001.png" in names, names
+        assert "annotations/level1.json" in names, names
+        assert not any(name.startswith("Exp/") for name in names), names
 
-        # Unzipping yields a folder Project.open accepts directly.
+        # Unzipping the root-level entries yields a folder Project.open accepts directly.
         extract = Path(out) / "x"
         with zipfile.ZipFile(written) as archive:
             archive.extractall(extract)
-        reopened = open_project(str(extract / "Exp"), image_size=STUB_SIZE)
+        reopened = open_project(str(extract), image_size=STUB_SIZE)
         assert len(reopened.registry_images()) == 1
         assert reopened.read_level(1).get("scene_000000001.png")
 
