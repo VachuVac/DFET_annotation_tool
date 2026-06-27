@@ -1,5 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import re
+from pathlib import Path
+
+# Single source of truth for name + version is src/constants.py. Read it without
+# importing (the module runs DPI/windll detection at import time we don't want here).
+_constants_src = Path('src/constants.py').read_text(encoding='utf-8')
+APP_NAME = re.search(r'APP_NAME\s*=\s*["\']([^"\']+)["\']', _constants_src).group(1)
+APP_VERSION = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', _constants_src).group(1)
+# e.g. "Annotation Workbench 1.1" -> dist/Annotation Workbench 1.1.exe
+BUILD_NAME = f"{APP_NAME} {APP_VERSION}"
 
 a = Analysis(
     ['review.py'],
@@ -31,7 +41,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Annotation Workbench',
+    name=BUILD_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

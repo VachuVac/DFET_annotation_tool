@@ -10,6 +10,12 @@ if (-not (Test-Path $envPython)) {
 
 Write-Host "Using Python:" $envPython
 
+# Derive the build name (incl. version) from the single source of truth in constants.
+$constantsSrc = Get-Content "src/constants.py" -Raw
+$appName = [regex]::Match($constantsSrc, 'APP_NAME\s*=\s*["'']([^"'']+)["'']').Groups[1].Value
+$appVersion = [regex]::Match($constantsSrc, 'APP_VERSION\s*=\s*["'']([^"'']+)["'']').Groups[1].Value
+$buildName = "$appName $appVersion"
+
 # Ensure PyInstaller is available in the selected environment.
 & $envPython -m pip show pyinstaller *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -25,7 +31,7 @@ if (Test-Path "review_app.spec") {
     & $envPython -m PyInstaller --noconfirm --clean "review_app.spec"
 } else {
     Write-Host "Spec file not found. Building with default options from review.py"
-    & $envPython -m PyInstaller --noconfirm --clean --name "Annotation Workbench" --icon "src/assets/app_icon.ico" "review.py"
+    & $envPython -m PyInstaller --noconfirm --clean --name "$buildName" --icon "src/assets/app_icon.ico" "review.py"
 }
 
 if ($LASTEXITCODE -ne 0) {
@@ -36,4 +42,4 @@ if ($LASTEXITCODE -ne 0) {
 # folder is throwaway intermediate work and does NOT need to be shared.
 Write-Host ""
 Write-Host "Build complete."
-Write-Host "Share THIS file: dist\Annotation Workbench.exe"
+Write-Host "Share THIS file: dist\$buildName.exe"
