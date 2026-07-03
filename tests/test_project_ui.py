@@ -30,12 +30,16 @@ from src import levels
 from src.constants import APP_NAME, APP_VERSION
 from src.project import Project
 from src.qt_main import (
+    ActionPickerDialog,
     ClassBubbleButton,
     CollapsibleClassGroup,
+    ImageCanvas,
     KeyCapButton,
     ObjectRowButton,
     PyQtAnnotationReview,
     RedefineDialog,
+    SettingsDialog,
+    ToggleSwitch,
 )
 
 BASE_TITLE = f"{APP_NAME} {APP_VERSION}"
@@ -63,10 +67,10 @@ def _window() -> PyQtAnnotationReview:
 
 def test_starts_on_welcome_screen() -> None:
     window = _window()
-    # Index 0 == welcome page; no project, import menu disabled.
+    # Index 0 == welcome page; no project, import entry disabled.
     assert window.view_stack.currentIndex() == 0
     assert window.project is None
-    assert window.import_menu.isEnabled() is False
+    assert window.import_action.isEnabled() is False
     assert window.action_close_project.isEnabled() is False
     assert window.windowTitle() == BASE_TITLE
 
@@ -97,7 +101,7 @@ def test_workflow_help_has_en_and_cz_translations() -> None:
     # Czech is actually translated (Czech section headers / diacritics present).
     assert "ÚROVNĚ" in cz and "REŽIMY" in cz and "ÚPRAVY" in cz
     # App UI labels stay in English in BOTH so they match the interface.
-    for token in ("Project ▸", "Validation", "Annotate", "Edit objects (T)"):
+    for token in ("Project ▸", "Validation", "Annotate", "Edit objects"):
         assert token in en and token in cz
 
 
@@ -125,7 +129,7 @@ def test_activate_project_switches_to_main_view() -> None:
         project = Project.create(parent, "Demo", image_size=STUB_SIZE)
         window._activate_project(project)
         assert window.view_stack.currentIndex() == 1  # main working view
-        assert window.import_menu.isEnabled() is True
+        assert window.import_action.isEnabled() is True
         assert window.action_close_project.isEnabled() is True
         assert "Demo" in window.windowTitle()
         # Empty project: no images yet, annotation_root points into the project.
@@ -974,15 +978,546 @@ def test_move_whole_l2_box_drag_and_undo() -> None:
         window._undo()
         assert ann["bbox"] == [0, 0, 10, 10]
 
-        # A polygon body (L1) is NOT movable — pressing it only selects.
+        # A polygon body press first only SELECTS (it isn't selected yet); moving it
+        # whole needs a second body-drag — see test_move_whole_polygon_after_select.
         window._set_level(1)
         poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
         window.annotation_store[1].setdefault(basename, []).append(poly)
         window._refresh_overlay_items()
         canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
-        assert canvas._box_move_item is None           # polygons don't move whole
+        assert canvas._box_move_item is None           # first press only selects
         assert canvas.selected_annotation() is poly
         canvas.mouseReleaseEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+
+
+def test_copy_paste_duplicates_selected_object_offset_and_undoable() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas = window.canvas
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+
+        # Copy/paste follow the editing state. In the new model editing is off only
+        # while the Draw pen is armed, so copy is a no-op then.
+        window.draw_button.setChecked(True)
+        canvas._set_selected(poly)
+        window._copy_selected_annotation()
+        assert window._clipboard is None  # drawing -> editing off -> can't copy
+        window.draw_button.setChecked(False)  # pen up -> editing (and copy/paste) active
+
+        # Nothing selected -> copy is a no-op, paste has nothing to do.
+        canvas._set_selected(None)
+        window._copy_selected_annotation()
+        assert window._clipboard is None
+        window._paste_annotation()
+        assert len(window._current_level_annotations()) == 1
+
+        # Select + copy + paste: a second object appears, offset from the original so
+        # it doesn't sit invisibly on top (cursor isn't over the image in headless).
+        canvas._set_selected(poly)
+        window._copy_selected_annotation()
+        assert window._clipboard is not None and window._clipboard["level"] == 1
+        window._paste_annotation()
+        anns = window._current_level_annotations()
+        assert len(anns) == 2
+        pasted = anns[-1]
+        assert pasted is not poly
+        assert window.canvas.selected_annotation() is pasted  # paste is selected
+        # Same shape/size, shifted away from the source (its bbox origin moved).
+        assert pasted["bbox"][2:] == [10, 10]                 # width/height preserved
+        assert (pasted["bbox"][0], pasted["bbox"][1]) != (0, 0)  # nudged off the original
+        assert window._annotation_center(pasted) != window._annotation_center(poly)
+
+        # A second paste steps further so it doesn't stack on the first copy.
+        window._paste_annotation()
+        anns = window._current_level_annotations()
+        assert len(anns) == 3
+        centers = [window._annotation_center(a) for a in anns]
+        assert len(set(centers)) == 3  # all three objects are at distinct positions
+
+        # Paste is undoable like any created object.
+        window._undo()
+        assert len(window._current_level_annotations()) == 2
+        window._undo()
+        assert len(window._current_level_annotations()) == 1
+
+
+def test_paste_stays_inside_image_bounds() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=20)
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas = window.canvas
+        # A box hugging the bottom-right corner: the nudge must not push it off-image.
+        poly = {"category_id": 1, "segmentation": [[12, 12, 20, 12, 20, 20, 12, 20]], "bbox": [12, 12, 8, 8], "area": 64}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+        window.edit_objects_button.setChecked(True)  # a tool must be active for copy/paste
+        canvas._set_selected(poly)
+        window._copy_selected_annotation()
+        window._paste_annotation()
+        pasted = window._current_level_annotations()[-1]
+        seg = pasted["segmentation"][0]
+        xs, ys = seg[0::2], seg[1::2]
+        assert min(xs) >= -0.01 and max(xs) <= 20.01
+        assert min(ys) >= -0.01 and max(ys) <= 20.01
+
+
+def test_new_annotation_model_editing_always_on() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        assert window._legacy_mode is False  # the new single-Draw model is the default
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas = window.canvas
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+
+        # No Edit button; editing is active with the pen up (draw off).
+        assert window.edit_objects_button.isHidden() is True
+        assert window.draw_button.isChecked() is False
+        assert window._editing_active() is True
+        assert canvas._edit_enabled is True
+
+        # Selecting an object offers change-class + Delete + copy (all edit behaviours).
+        canvas._set_selected(poly)
+        assert window._redefine_panel_active is True
+        assert window.delete_button.isEnabled() is True
+        window._copy_selected_annotation()
+        assert window._clipboard is not None
+
+        # Arming Draw turns editing OFF and clears the selection (draw takes over).
+        window.draw_button.setChecked(True)
+        assert window._editing_active() is False
+        assert canvas._edit_enabled is False
+        assert canvas.selected_annotation() is None
+        assert window._copy_paste_active() is False
+        # Dropping the pen restores editing.
+        window.draw_button.setChecked(False)
+        assert window._editing_active() is True
+        assert canvas._edit_enabled is True
+
+
+def test_legacy_mode_two_button_workflow() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        window._legacy_mode = True  # set directly (avoids writing the settings file)
+        window._apply_mode_chrome()
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas = window.canvas
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+
+        # Both toggles visible; editing is OFF by default (the old non-destructive state).
+        assert window.draw_button.isHidden() is False
+        assert window.edit_objects_button.isHidden() is False
+        assert window._editing_active() is False
+        assert canvas._edit_enabled is False
+
+        # Turning Edit on enables editing; Draw and Edit stay mutually exclusive.
+        window.edit_objects_button.setChecked(True)
+        assert window._editing_active() is True
+        assert canvas._edit_enabled is True
+        window.draw_button.setChecked(True)
+        assert window.edit_objects_button.isChecked() is False
+        assert window._editing_active() is False
+
+
+def test_legacy_mode_toggle_persists_and_swaps_chrome() -> None:
+    import src.qt_main as qm
+
+    saved: dict = {}
+    original_save = qm.save_app_settings
+    qm.save_app_settings = lambda s: saved.update(s)
+    try:
+        window = _window()
+        with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+            _project, _basename = _project_with_image(window, parent, src)
+            window._set_mode("annotation")
+            assert window.edit_objects_button.isHidden() is True  # new model: no Edit button
+
+            window._on_legacy_mode_toggled(True)  # flip to legacy (the Settings toggle handler)
+            assert window._legacy_mode is True
+            assert saved.get("legacy_draw_edit") is True          # persisted
+            assert window.edit_objects_button.isHidden() is False  # legacy shows the Edit button
+
+            window._on_legacy_mode_toggled(False)  # back to new
+            assert window._legacy_mode is False
+            assert window.edit_objects_button.isHidden() is True
+    finally:
+        qm.save_app_settings = original_save
+
+
+def test_toggle_switch_widget_basic() -> None:
+    sw = ToggleSwitch(False)
+    seen = []
+    sw.toggled.connect(seen.append)
+    assert sw.isChecked() is False
+    sw.setChecked(True, animate=False)
+    assert sw.isChecked() is True and seen == [True]
+    sw.setChecked(True, animate=False)  # no-op, no repeat signal
+    assert seen == [True]
+
+
+def test_settings_dialog_tabs_label_size_and_legacy() -> None:
+    import src.qt_main as qm
+
+    saved: dict = {}
+    original_save = qm.save_app_settings
+    qm.save_app_settings = lambda s: saved.update(s)
+    try:
+        window = _window()
+        # Opens on the requested tab.
+        d_general = SettingsDialog(window, initial_tab="general")
+        assert d_general.tabs.currentIndex() == 0
+        d_shortcuts = SettingsDialog(window, initial_tab="shortcuts")
+        assert d_shortcuts.tabs.currentIndex() == 1
+
+        # Label-size slider live-scales the canvas; releasing persists it.
+        d_general._on_label_size_changed(150)
+        assert window.label_scale == 1.5 and window.canvas.label_scale == 1.5
+        d_general._on_label_size_released()
+        assert saved.get("label_scale") == 1.5
+
+        # The legacy switch drives + persists the annotation model.
+        assert d_general.legacy_switch.isChecked() is False
+        d_general.legacy_switch.setChecked(True)
+        assert window._legacy_mode is True and saved.get("legacy_draw_edit") is True
+        d_general.deleteLater()
+        d_shortcuts.deleteLater()
+    finally:
+        qm.save_app_settings = original_save
+
+
+def test_show_labels_switch_persists_and_toggles_canvas() -> None:
+    import src.qt_main as qm
+
+    saved: dict = {}
+    original_save = qm.save_app_settings
+    qm.save_app_settings = lambda s: saved.update(s)
+    try:
+        window = _window()
+        assert window.show_labels is True
+        window.labels_switch.setChecked(False)
+        assert window.show_labels is False
+        assert saved.get("show_labels") is False
+        assert window.canvas.show_labels is False
+    finally:
+        qm.save_app_settings = original_save
+
+
+def test_action_picker_dialog_renders_actions() -> None:
+    from PyQt6.QtWidgets import QPushButton
+
+    window = _window()
+    dialog = ActionPickerDialog(window, "Test", [
+        ("a", "Do A", "does A", True),
+        ("b", "Do B", "does B (disabled)", False),
+    ])
+    buttons = [b for b in dialog.findChildren(QPushButton) if b.objectName() == "pickAction"]
+    assert [b.text() for b in buttons] == ["Do A", "Do B"]
+    assert [b.isEnabled() for b in buttons] == [True, False]
+    dialog._pick("a")
+    assert dialog.chosen == "a"
+
+
+def _capture_picker(monkeypatch_target):
+    """Stub ActionPickerDialog to capture the actions list without a real modal exec."""
+    captured: dict = {}
+
+    class _Fake:
+        def __init__(self, owner, title, actions):
+            captured["title"] = title
+            captured["actions"] = actions
+            self.chosen = None
+
+        def exec(self):
+            return 0
+
+    monkeypatch_target.ActionPickerDialog = _Fake
+    return captured
+
+
+def test_import_window_actions_names_and_gating() -> None:
+    import src.qt_main as qm
+
+    original = qm.ActionPickerDialog
+    try:
+        # Project WITH an image -> annotations enabled.
+        window = _window()
+        with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+            _project, _basename = _project_with_image(window, parent, src)
+            captured = _capture_picker(qm)
+            window._open_import_window()
+            labels = [a[1] for a in captured["actions"]]
+            gating = {a[0]: a[3] for a in captured["actions"]}
+            assert labels == ["Open images folder", "Open zip from LS", "Open annotations (JSON)"]
+            assert gating == {"images": True, "zip": True, "annotations": True}
+
+        # Empty project (no images) -> annotations disabled.
+        window2 = _window()
+        with tempfile.TemporaryDirectory() as parent:
+            project = Project.create(parent, "Empty", image_size=STUB_SIZE)
+            window2._activate_project(project)
+            captured2 = _capture_picker(qm)
+            window2._open_import_window()
+            gating2 = {a[0]: a[3] for a in captured2["actions"]}
+            assert gating2["annotations"] is False
+    finally:
+        qm.ActionPickerDialog = original
+
+
+def test_project_window_actions_gating_and_routes() -> None:
+    import src.qt_main as qm
+
+    original = qm.ActionPickerDialog
+    try:
+        # No project: close / export / redefine are disabled.
+        window = _window()
+        captured = _capture_picker(qm)
+        window._open_project_window()
+        gating = {a[0]: a[3] for a in captured["actions"]}
+        assert [a[0] for a in captured["actions"]] == ["new", "open", "close", "export", "redefine"]
+        assert gating["new"] is True and gating["open"] is True
+        assert gating["close"] is False and gating["export"] is False and gating["redefine"] is False
+
+        # Routing: a chosen id runs the matching handler.
+        called: list[str] = []
+        window._open_project = lambda: called.append("open")  # type: ignore[assignment]
+
+        class _Fake:
+            def __init__(self, owner, title, actions):
+                self.chosen = "open"
+
+            def exec(self):
+                return 0
+
+        qm.ActionPickerDialog = _Fake
+        window._open_project_window()
+        assert called == ["open"]
+    finally:
+        qm.ActionPickerDialog = original
+
+
+def test_open_import_window_routes_to_handler() -> None:
+    import src.qt_main as qm
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, _basename = _project_with_image(window, parent, src)
+        called: list[str] = []
+        window._import_zip = lambda: called.append("zip")  # type: ignore[assignment]
+
+        class _FakeImport:  # avoid a real modal exec() in headless
+            def __init__(self, owner, title, actions):
+                self.chosen = "zip"
+
+            def exec(self):
+                return 1
+
+        original = qm.ActionPickerDialog
+        qm.ActionPickerDialog = _FakeImport  # type: ignore[assignment]
+        try:
+            window._open_import_window()
+            assert called == ["zip"]
+        finally:
+            qm.ActionPickerDialog = original  # type: ignore[assignment]
+
+
+def test_unified_tool_shortcut_is_mode_aware() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, _basename = _project_with_image(window, parent, src)
+
+        # Annotation: the single tool shortcut toggles Draw.
+        window._set_mode("annotation")
+        assert window.draw_button.isChecked() is False
+        window._toggle_tool_shortcut()
+        assert window.draw_button.isChecked() is True
+        window._toggle_tool_shortcut()
+        assert window.draw_button.isChecked() is False
+
+        # Validation: the SAME shortcut toggles Edit objects instead.
+        window._set_mode("validation")
+        assert window.edit_objects_button.isChecked() is False
+        window._toggle_tool_shortcut()
+        assert window.edit_objects_button.isChecked() is True
+        window._toggle_tool_shortcut()
+        assert window.edit_objects_button.isChecked() is False
+
+
+def test_draw_mode_disables_selection_and_deselects() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas = window.canvas
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+
+        # Selected with the pen up.
+        canvas._set_selected(poly)
+        assert canvas.selected_annotation() is poly
+
+        # Switching to Draw mode deselects it and turns selection off.
+        window.draw_button.setChecked(True)
+        assert canvas.selected_annotation() is None
+        assert canvas._select_enabled is False
+
+        # A canvas click in draw mode (no active class -> pen inactive) still can't select.
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+        canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas.selected_annotation() is None
+
+        # Shift-clicking an object row can't select while drawing either.
+        window._on_object_row_activated(poly, shift=True)
+        assert canvas.selected_annotation() is None
+
+        # Pen back up: selection is available again.
+        window.draw_button.setChecked(False)
+        assert canvas._select_enabled is True
+
+
+def test_hover_highlights_object_and_its_label() -> None:
+    from PyQt6.QtCore import QPointF
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        name, cid = _l1_class()
+        # A small object with room around it so its label can sit off the body.
+        ann = _poly_ann(cid, [30, 40, 40, 40, 40, 50, 30, 50])
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)  # validation on a project: selecting (and hover) is enabled
+        canvas = window.canvas
+        canvas.fit_to_view()
+
+        def hover_image(px, py):
+            ix, iy, _w, _h = canvas._fit_display_rect()
+            z = canvas._zoom
+            canvas.mouseMoveEvent(_FakeMouse(ix + px * z, iy + py * z, Qt.MouseButton.NoButton))
+
+        # Over the object body -> it becomes the hover target.
+        hover_image(35, 45)
+        assert canvas._hover_annotation is ann
+        # Empty space -> hover clears.
+        hover_image(5, 5)
+        assert canvas._hover_annotation is None
+
+        # Pin the label far above the body (clamps to the image top), then hover it:
+        # the LABEL alone highlights the object even though the body isn't under the cursor.
+        canvas._label_offsets[id(ann)] = QPointF(0.0, -100.0)
+        _render_overlays(canvas)
+        label_center = canvas._label_hit_rects[-1][0].center()
+        assert canvas._hit_test_annotation(label_center) is None  # cursor is off the body
+        canvas.mouseMoveEvent(_FakeMouse(label_center.x(), label_center.y(), Qt.MouseButton.NoButton))
+        assert canvas._hover_annotation is ann
+
+        # Leaving the widget clears it.
+        canvas.leaveEvent(None)
+        assert canvas._hover_annotation is None
+
+        # The already-selected object isn't hover-highlighted (it has the bright border).
+        canvas._set_selected(ann)
+        hover_image(35, 45)
+        assert canvas._hover_annotation is None
+
+        # Draw mode never hover-highlights (a click there draws, it can't select).
+        canvas._set_selected(None)
+        window._set_mode("annotation")
+        window._set_level(1)
+        window.draw_button.setChecked(True)
+        canvas.fit_to_view()
+        hover_image(35, 45)
+        assert canvas._hover_annotation is None
+
+
+def test_draw_mode_label_drag_repositions_without_selecting() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 4, 0, 4, 4, 0, 4])
+        window.annotation_store[1][basename] = [ann]
+        window._set_mode("annotation")
+        window._set_level(1)
+        canvas = window.canvas
+        canvas.fit_to_view()
+
+        # Draw ON with no class picked -> pen inactive (_draw_shape None), so a
+        # Shift+label click still reaches the label-reposition path.
+        window.draw_button.setChecked(True)
+        assert canvas._draw_shape is None and canvas._draw_active is True
+
+        _render_overlays(canvas)
+        rect, hit_ann = canvas._label_hit_rects[-1]
+        assert hit_ann is ann
+        center = rect.center()
+        shift = Qt.KeyboardModifier.ShiftModifier
+        canvas.mousePressEvent(_FakeMouse(center.x(), center.y(), Qt.MouseButton.LeftButton, shift))
+        # The label grabs for repositioning, but draw mode never selects.
+        assert canvas._label_drag_ann is ann
+        assert canvas.selected_annotation() is None
+        canvas.mouseMoveEvent(_FakeMouse(center.x() + 10, center.y() + 6, Qt.MouseButton.LeftButton, shift))
+        canvas.mouseReleaseEvent(_FakeMouse(center.x() + 10, center.y() + 6, Qt.MouseButton.LeftButton))
+        assert canvas._label_drag_ann is None
+        assert id(ann) in canvas._label_offsets      # the label actually moved
+        assert canvas.selected_annotation() is None  # still nothing selected
+
+
+def test_move_whole_polygon_after_select() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src, size=64)
+        window._set_mode("annotation")
+        window._set_level(1)  # L1 polygons
+        canvas = window.canvas
+        poly = {"category_id": 1, "segmentation": [[0, 0, 10, 0, 10, 10, 0, 10]], "bbox": [0, 0, 10, 10], "area": 100}
+        window.annotation_store[1].setdefault(basename, []).append(poly)
+        window._refresh_overlay_items()
+        canvas.set_edit_enabled(True)
+        ix, iy, _w, _h = canvas._fit_display_rect()
+        z = canvas._zoom
+
+        # First body press only SELECTS (nothing moves while unselected).
+        canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is None
+        assert canvas.selected_annotation() is poly
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+
+        # Now selected: a body press-drag moves the WHOLE polygon by (+3, +2).
+        canvas.mousePressEvent(_FakeMouse(ix + 5 * z, iy + 5 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is not None
+        canvas.mouseMoveEvent(_FakeMouse(ix + 8 * z, iy + 7 * z, Qt.MouseButton.LeftButton))
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 8 * z, iy + 7 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is None
+        assert poly["segmentation"][0] == [3, 2, 13, 2, 13, 12, 3, 12]  # whole contour shifted
+        assert poly["bbox"] == [3.0, 2.0, 10.0, 10.0]
+        assert poly["area"] == 100  # translation preserves area
+
+        window._undo()
+        assert poly["segmentation"][0] == [0, 0, 10, 0, 10, 10, 0, 10]
+        assert poly["bbox"] == [0, 0, 10, 10]
+
+        # A press ON a vertex (corner 10,10) still edits that point, not a whole move.
+        canvas._set_selected(poly)
+        canvas.mousePressEvent(_FakeMouse(ix + 10 * z, iy + 10 * z, Qt.MouseButton.LeftButton))
+        assert canvas._box_move_item is None
+        assert canvas._drag_vertex is not None
+        canvas.mouseReleaseEvent(_FakeMouse(ix + 10 * z, iy + 10 * z, Qt.MouseButton.LeftButton))
 
 
 def test_box_move_is_clamped_to_image_bounds() -> None:
@@ -1751,7 +2286,9 @@ def test_annotation_pill_selects_draw_class_with_pen_down() -> None:
         window._set_mode("annotation")
         window._set_level(1)
         window.draw_button.setChecked(True)  # pen down
-        assert window.class_action_widget.isHidden() is True  # show/hide-all hidden while drawing
+        # Show/Hide-all stay available in draw mode too (they toggle overlay
+        # visibility, independent of the pills picking the active draw class).
+        assert window.class_action_widget.isHidden() is False
 
         bubble = next(b for b in window.class_list_container.findChildren(ClassBubbleButton) if b.category_id == cid)
         bubble.toggled.emit(True)
@@ -1857,13 +2394,16 @@ def test_object_row_dims_when_individually_hidden() -> None:
 
 def test_default_shortcuts_only_undo_redo_save_enabled() -> None:
     window = _window()
-    # Out of the box only Undo / Redo / Save have keys; everything else is unbound.
+    # Out of the box Undo / Redo / Save and copy/paste have keys; everything else is unbound.
+    default_enabled = {"undo", "redo", "save", "copy_object", "paste_object"}
     enabled = {aid for aid in window.shortcut_order() if window.shortcut_primary(aid)}
-    assert enabled == {"undo", "redo", "save"}
+    assert enabled == default_enabled
     # The live dispatch index resolves only those actions (redo's reserved alias too).
-    assert set(window._shortcut_index.values()) == {"undo", "redo", "save"}
+    assert set(window._shortcut_index.values()) == default_enabled
     assert window._shortcut_index.get("Ctrl+Z") == "undo"
     assert window._shortcut_index.get("Ctrl+S") == "save"
+    assert window._shortcut_index.get("Ctrl+C") == "copy_object"
+    assert window._shortcut_index.get("Ctrl+V") == "paste_object"
 
 
 def test_clear_shortcut_disables_and_rebind_reenables() -> None:
@@ -2101,6 +2641,81 @@ def test_label_shift_drag_repositions_and_selects() -> None:
         assert canvas._label_offsets == {}
 
 
+def test_label_plain_click_selects_object() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 4, 0, 4, 4, 0, 4])
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)  # validation on a project: selection is enabled
+        canvas = window.canvas
+        canvas.fit_to_view()
+
+        _render_overlays(canvas)
+        rect, hit_ann = canvas._label_hit_rects[-1]
+        assert hit_ann is ann
+        center = rect.center()
+        # A plain (no-modifier) click on the LABEL selects the object, just like
+        # clicking its body — and does NOT start a reposition drag (that needs Shift).
+        canvas.mousePressEvent(_FakeMouse(center.x(), center.y(), Qt.MouseButton.LeftButton))
+        assert canvas.selected_annotation() is ann
+        assert canvas._label_drag_ann is None
+
+
+def test_selected_object_label_gets_white_highlight() -> None:
+    from PyQt6.QtGui import QPainter
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        name, cid = _l1_class()
+        ann = _poly_ann(cid, [0, 0, 4, 0, 4, 4, 0, 4])
+        window.annotation_store[1][basename] = [ann]
+        window._set_level(1)
+        canvas = window.canvas
+        canvas.fit_to_view()
+
+        def render_and_count_border_white() -> int:
+            img = QImage(max(1, canvas.width()), max(1, canvas.height()), QImage.Format.Format_ARGB32)
+            img.fill(0)
+            painter = QPainter(img)
+            ix, iy, _w, _h = canvas._fit_display_rect()
+            canvas._draw_overlays(painter, ix, iy)
+            painter.end()
+            rect = canvas._label_hit_rects[-1][0].adjusted(-4.0, -4.0, 4.0, 4.0)
+            x0, y0 = max(0, int(rect.left())), max(0, int(rect.top()))
+            x1, y1 = min(img.width(), int(rect.right()) + 1), min(img.height(), int(rect.bottom()) + 1)
+            white = 0
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    c = img.pixelColor(x, y)
+                    if c.alpha() > 200 and c.red() > 245 and c.green() > 245 and c.blue() > 245:
+                        white += 1
+            return white
+
+        canvas._set_selected(None)
+        base_white = render_and_count_border_white()  # only the white glyph text
+        canvas._set_selected(ann)
+        selected_white = render_and_count_border_white()  # glyphs + the white border ring
+        assert selected_white > base_white
+
+
+def test_selected_object_row_keeps_white_border_on_hover() -> None:
+    from PyQt6.QtGui import QColor
+
+    row = ObjectRowButton({}, "Object 1", QColor(200, 90, 90), hidden=False)
+    white = "2px solid rgba(255,255,255,0.95)"
+    row.set_selected(True)
+    # The white highlight must be in BOTH the base rule and the :hover rule so that
+    # hovering a selected row doesn't erase the selection border.
+    _base, hover_rule = row.styleSheet().split(":hover", 1)
+    assert white in _base and white in hover_rule
+    # Unselected rows carry no white border and just darken on hover.
+    row.set_selected(False)
+    assert white not in row.styleSheet()
+
+
 def test_label_hidden_when_object_is_off_screen() -> None:
     from PyQt6.QtCore import QPoint
 
@@ -2264,6 +2879,126 @@ def test_run_in_background_reports_worker_errors() -> None:
     window._run_in_background("test", work, done)
     assert _pump_until(lambda: window._bg_task is None and "error" in captured)
     assert isinstance(captured["error"], RuntimeError) and captured["result"] is None
+
+
+def test_oriented_box_width_clamped_to_image_bounds() -> None:
+    # v1.2 fix: with p1->p2 along the top edge, dragging the thickness past the image
+    # height must stop AT the border. Without bounds the far corners escaped (the bug:
+    # you could set the width through the border after clicking near the edge).
+    p1, p2 = (10.0, 0.0), (40.0, 0.0)
+    p3 = (25.0, 30.0)  # thickness dragged 30px down; the image is only 20px tall
+    unclamped, _rot = ImageCanvas._oriented_box(p1, p2, p3)
+    assert max(y for _x, y in unclamped) == 30.0  # escapes the image with no bounds
+    clamped, _rot = ImageCanvas._oriented_box(p1, p2, p3, (100.0, 20.0))
+    assert clamped is not None
+    for x, y in clamped:
+        assert -0.5 <= x <= 100.5 and -0.5 <= y <= 20.5  # every corner stays inside
+    assert max(y for _x, y in clamped) == 20.0  # thickness stops exactly at the border
+
+
+def test_remove_last_point_any_steps_back_drawing() -> None:
+    window = _window()
+    canvas = window.canvas
+    # Polygon: pops the most recently placed vertex, one at a time.
+    canvas._poly_points = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+    assert canvas.remove_last_point_any() is True
+    assert canvas._poly_points == [(0.0, 0.0), (1.0, 0.0)]
+    # Rotated box mid-draw: pops the centre-line end and drops the rotated flag.
+    canvas._poly_points = []
+    canvas._box_pts = [(0.0, 0.0), (5.0, 0.0)]
+    canvas._box_rotated = True
+    assert canvas.remove_last_point_any() is True
+    assert canvas._box_pts == [(0.0, 0.0)]
+    assert canvas._box_rotated is False
+    # Nothing pending -> no-op, so Ctrl+Z falls through to the normal object undo.
+    canvas._box_pts = []
+    assert canvas.remove_last_point_any() is False
+
+
+def test_ctrl_z_removes_last_point_while_drawing() -> None:
+    from PyQt6.QtCore import QEvent
+    from PyQt6.QtGui import QKeyEvent
+
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, _basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+        window.canvas.set_draw_shape("polygon", (255, 255, 255))
+        window.canvas._poly_points = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        assert window._shortcut_index.get("Ctrl+Z") == "undo"
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        window.keyPressEvent(event)
+        # The in-progress vertex is dropped, and the committed-object undo stack is
+        # left untouched (points never enter it).
+        assert window.canvas._poly_points == [(0.0, 0.0), (1.0, 0.0)]
+        assert window._undo_stack == []
+
+
+def test_entering_draw_mode_shows_all_classes() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        _name, cid = _l1_class()
+        window.annotation_store[1][basename] = [_poly_ann(cid, [0, 0, 3, 0, 3, 3, 0, 3])]
+        window._set_mode("annotation")
+        window._set_level(1)
+        # Hide everything with the pen up.
+        window._hide_all_classes()
+        assert window.visible_by_category.get(cid) is False
+        assert not any(it.get("annotation") for it in window.current_overlay_items)
+        # Arming the pen reveals every class again (like clicking Show all).
+        window.draw_button.setChecked(True)
+        assert window.visible_by_category.get(cid) is True
+        assert any(it.get("annotation") for it in window.current_overlay_items)
+
+
+def test_shift_click_level_overlays_show_other_levels_readonly() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, basename = _project_with_image(window, parent, src)
+        _l1_name, l1_cid = _l1_class()
+        l2_cid = levels.category_id_for_class(2, "high_vegetation")
+        window.annotation_store[1][basename] = [_poly_ann(l1_cid, [0, 0, 3, 0, 3, 3, 0, 3])]
+        window.annotation_store[2][basename] = [{"category_id": l2_cid, "bbox": [0, 0, 2, 2], "area": 4}]
+        window._set_mode("annotation")
+        window._set_level(1)  # primary L1: only its objects show, editable
+        assert not any(it.get("secondary_level") for it in window.current_overlay_items)
+
+        # Shift+click L2: its box is layered read-only on top of L1.
+        window._extra_overlay_levels.add(2)
+        window._refresh_overlay_items()
+        secondary = [it for it in window.current_overlay_items if it.get("secondary_level") == 2]
+        assert len(secondary) == 1
+        assert secondary[0]["annotation"] is None  # view-only, not selectable
+        assert secondary[0]["editable"] is False
+        # The L1 object is still present and still editable/selectable.
+        assert any(it.get("annotation") and it.get("editable") for it in window.current_overlay_items)
+
+        # A plain level switch collapses back to a single level (overlays dropped).
+        window._set_level(1)
+        assert window._extra_overlay_levels == set()
+        assert not any(it.get("secondary_level") for it in window.current_overlay_items)
+
+
+def test_shift_click_level_button_states_primary_vs_secondary() -> None:
+    window = _window()
+    with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as src:
+        _project, _basename = _project_with_image(window, parent, src)
+        window._set_mode("annotation")
+        window._set_level(1)
+        window._extra_overlay_levels.add(2)
+        window._refresh_level_button_states()
+        assert window.level_buttons[1].isChecked() is True
+        assert bool(window.level_buttons[1].property("secondaryLevel")) is False  # active = primary
+        assert window.level_buttons[2].isChecked() is True
+        assert bool(window.level_buttons[2].property("secondaryLevel")) is True  # overlay = secondary
+        assert window.level_buttons[3].isChecked() is False
+        # Switching primary to L3 clears the L2 overlay's checked + secondary state.
+        window._set_level(3)
+        assert window.level_buttons[2].isChecked() is False
+        assert bool(window.level_buttons[2].property("secondaryLevel")) is False
+        assert window.level_buttons[3].isChecked() is True
 
 
 def _run_all() -> int:

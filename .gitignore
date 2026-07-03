@@ -8,6 +8,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# Per-user runtime settings (generated on demand; not shipped)
+src/app_settings.json
+src/settings.json
+
 # OS cruft
 Thumbs.db
 .DS_Store

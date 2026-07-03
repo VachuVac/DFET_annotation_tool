@@ -30,11 +30,12 @@ from . import levels
 from .project import Project, ProjectError
 
 try:
-    from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QThread, QTimer, pyqtProperty, pyqtSignal
     from PyQt6.QtGui import (
         QAction,
         QClipboard,
         QColor,
+        QCursor,
         QFont,
         QFontMetrics,
         QIcon,
@@ -43,6 +44,7 @@ try:
         QKeyEvent,
         QKeySequence,
         QPainter,
+        QPalette,
         QPainterPath,
         QPen,
         QPixmap,
@@ -67,6 +69,7 @@ try:
         QMessageBox,
         QPushButton,
         QListView,
+        QProxyStyle,
         QScrollArea,
         QSizePolicy,
         QSlider,
@@ -74,6 +77,7 @@ try:
         QStackedWidget,
         QStyle,
         QStyledItemDelegate,
+        QTabWidget,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -166,33 +170,40 @@ def _image_code_cmp(a: str, b: str) -> int:
     return (key_a > key_b) - (key_a < key_b)
 
 
-def _user_data_dir() -> Path:
-    """Folder for the user's editable config (class colours, shortcuts).
-
-    Deliberately OUTSIDE the exe's own folder so a desktop-placed exe doesn't litter
-    the desktop with JSON files. Defaults to ``Documents/<APP_NAME>`` (discoverable, so
-    the user can find/edit the colour file); falls back to the home folder if Documents
-    is missing or can't be created. Only used by the frozen build — source/test runs
-    keep their configs next to the package."""
+def _legacy_user_data_dir() -> Path:
+    """The OLD frozen config location (``Documents/<APP_NAME>``). Kept ONLY as a
+    one-time migration source — configs now live in the local app folder below. Not
+    created here; we only read from it if it already exists."""
     docs = Path.home() / "Documents"
     base = docs if docs.is_dir() else Path.home()
-    folder = base / APP_NAME
+    return base / APP_NAME
+
+
+def _local_data_dir() -> Path:
+    """Folder for ALL of the user's editable config (class colours, shortcuts,
+    settings). Lives under ``%LOCALAPPDATA%/AnnotationWorkbench`` — the same app folder
+    the session logs use — so the app keeps one tidy local home instead of littering
+    Documents or the exe's own directory. Falls back to a home dotfolder if
+    LOCALAPPDATA is unavailable. Only used by the frozen build; source/test runs keep
+    their configs next to the package."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    root = (Path(base) / "AnnotationWorkbench") if base else (Path.home() / ".annotationworkbench")
     try:
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
+        root.mkdir(parents=True, exist_ok=True)
+        return root
     except Exception:
         return Path.home()
 
 
 def _color_config_path() -> Path:
     if getattr(sys, "frozen", False):
-        return _user_data_dir() / "class_colors.json"
+        return _local_data_dir() / "class_colors.json"
     return Path(__file__).resolve().parent / "class_colors.json"
 
 
 def _default_color_config_path() -> Path:
     if getattr(sys, "frozen", False):
-        return _user_data_dir() / "class_colors_default.json"
+        return _local_data_dir() / "class_colors_default.json"
     return Path(__file__).resolve().parent / "class_colors_default.json"
 
 
@@ -209,21 +220,25 @@ def _load_color_config() -> dict[str, str]:
 
 
 def _ensure_user_config_files() -> None:
-    """Frozen first-run: make sure the user's editable configs live in the user data
-    folder (Documents/<APP_NAME>), NOT next to the exe.
+    """Frozen first-run: make sure the user's editable configs live in the local app
+    folder (%LOCALAPPDATA%/AnnotationWorkbench), NOT next to the exe or in Documents.
 
     Colour configs are seeded from the bundled copies; any config the user already
-    edited next to the exe (older layout) is migrated over so customisations carry
-    forward. ``shortcuts.json`` has no bundled default, so it's migrate-only."""
+    customised in an OLDER location (next to the exe, or the previous Documents/<APP>
+    home) is copied over so customisations carry forward. The old files are LEFT in
+    place — we just stop reading them. ``shortcuts.json`` / ``settings.json`` have no
+    bundled default, so they're migrate-only."""
     if not getattr(sys, "frozen", False):
         return
-    data_dir = _user_data_dir()
+    data_dir = _local_data_dir()
     meipass = Path(sys._MEIPASS)
     exe_dir = Path(sys.executable).parent
+    old_docs_dir = _legacy_user_data_dir()  # the previous frozen home (Documents/<APP>)
     seeds = {
         "class_colors.json": meipass / "class_colors.json",
         "class_colors_default.json": meipass / "class_colors_default.json",
         "shortcuts.json": None,  # no bundled default — only migrate an existing one
+        "settings.json": None,   # ditto (consolidated user settings)
     }
     for filename, bundled in seeds.items():
         dest = data_dir / filename
@@ -240,13 +255,15 @@ def _ensure_user_config_files() -> None:
             continue
         if dest.exists():
             continue
-        legacy = exe_dir / filename  # prefer a file the user already customised
-        src = legacy if legacy.exists() else bundled
-        if src is not None and src.exists():
-            try:
-                shutil.copy2(src, dest)
-            except Exception:
-                pass
+        # Prefer a file the user already customised: previous Documents home first,
+        # then the even-older exe-adjacent layout, then the bundled default.
+        for candidate in (old_docs_dir / filename, exe_dir / filename, bundled):
+            if candidate is not None and candidate.exists():
+                try:
+                    shutil.copy2(candidate, dest)
+                except Exception:
+                    pass
+                break
 
 
 _ensure_user_config_files()
@@ -289,10 +306,10 @@ _migrate_superseded_default_colors()
 def _shortcut_config_path() -> Path:
     """User-editable keyboard shortcut overrides.
 
-    Frozen: in the user data folder (Documents/<APP_NAME>), so it doesn't litter the
-    exe's folder. Source/test: next to the package."""
+    Frozen: in the local app folder (%LOCALAPPDATA%/AnnotationWorkbench). Source/test:
+    next to the package."""
     if getattr(sys, "frozen", False):
-        return _user_data_dir() / "shortcuts.json"
+        return _local_data_dir() / "shortcuts.json"
     return Path(__file__).resolve().parent / "shortcuts.json"
 
 
@@ -313,6 +330,38 @@ def save_shortcut_config(bindings: dict[str, str]) -> None:
     try:
         with path.open("w", encoding="utf-8") as f:
             json.dump(bindings, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _app_settings_path() -> Path:
+    """Consolidated user settings store: legacy/new draw toggle, label opacity,
+    show-labels / show-points, label size, etc.
+
+    Same placement rule as the shortcut config: local app folder when frozen, next to
+    the package otherwise. Absent = all defaults, so it needs no bundled seed."""
+    if getattr(sys, "frozen", False):
+        return _local_data_dir() / "settings.json"
+    return Path(__file__).resolve().parent / "settings.json"
+
+
+def load_app_settings() -> dict:
+    path = _app_settings_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_app_settings(settings: dict) -> None:
+    path = _app_settings_path()
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=4, ensure_ascii=False)
     except Exception:
         pass
 
@@ -385,6 +434,7 @@ class ImageCanvas(QWidget):
         self.show_points = False
         self.show_labels = True
         self.annotation_opacity = 0.30
+        self.label_scale = 1.0  # multiplier for on-canvas label pill + text (Settings)
         # Editing state: drag annotation vertices/corners directly on the canvas.
         # Off by default; toggled on via the "Edit objects" button.
         self._edit_enabled = False
@@ -392,6 +442,9 @@ class ImageCanvas(QWidget):
         self._drag_before: dict | None = None
         self._vertex_moved = False
         self._hover_vertex: tuple[dict, int] | None = None
+        # Object under the cursor (when selecting is possible) — drawn with a soft
+        # highlight, subtler than the selected object's solid white outline.
+        self._hover_annotation: dict | None = None
         # A clicked (not dragged) polygon vertex stays SELECTED so Delete/Backspace
         # can remove it. Polygons only (L1/L3) — bboxes/oriented quads keep 4 corners.
         self._selected_vertex: tuple[dict, int] | None = None
@@ -422,6 +475,9 @@ class ImageCanvas(QWidget):
         self._label_drag_start = QPointF(0.0, 0.0)
         # Selection (annotation mode): click an annotation body to select; Delete removes it.
         self._select_enabled = False
+        # True while the Draw pen is armed (even with no class picked yet). In draw
+        # mode the working area never selects — any click clears the selection.
+        self._draw_active = False
         self._selected_annotation: dict | None = None
         # A parked "redefine" overlay can also be selected (to assign it a class).
         self._selected_redefine: dict | None = None
@@ -499,6 +555,7 @@ class ImageCanvas(QWidget):
         self._selected_vertex = None
         self._hover_vertex = None
         self._hover_edge = None
+        self._hover_annotation = None
         self.update()
 
     def _base_image_size(self) -> tuple[int, int]:
@@ -650,11 +707,36 @@ class ImageCanvas(QWidget):
         self.update()
 
     @staticmethod
-    def _oriented_box(p1, p2, p3) -> tuple[list[tuple[float, float]] | None, float]:
+    def _clamp_perp_offset(p1, p2, nx, ny, offset, bounds) -> float:
+        """Clamp a perpendicular thickness so both far box corners stay in the image.
+
+        The far edge is p1+offset*(nx,ny) and p2+offset*(nx,ny); we shrink |offset|
+        (keeping its sign / side) until neither corner leaves [0,w]x[0,h]. Because p1
+        and p2 already sit inside the image, offset=0 is always valid, so the clamp
+        interval spans zero and the box just can't grow through the border.
+        """
+        width, height = bounds
+        low, high = float("-inf"), float("inf")
+        for px, py in (p1, p2):
+            for coord, direction, limit in ((px, nx, width), (py, ny, height)):
+                if abs(direction) < 1e-9:
+                    continue  # this corner never moves along this axis
+                t1 = (0.0 - coord) / direction
+                t2 = (limit - coord) / direction
+                lo, hi = (t1, t2) if t1 <= t2 else (t2, t1)
+                low = max(low, lo)
+                high = min(high, hi)
+        return min(max(offset, low), high)
+
+    @staticmethod
+    def _oriented_box(p1, p2, p3, bounds=None) -> tuple[list[tuple[float, float]] | None, float]:
         """Rectangle with one edge p1->p2 and the opposite edge through p3.
 
         Returns (corners, rotation_degrees). p1->p2 is one long side; p3's signed
-        perpendicular distance from that line sets the thickness and side.
+        perpendicular distance from that line sets the thickness and side. When
+        ``bounds`` (image w, h) is given, the thickness is clamped so the box can't
+        extend through the image border (the width point p3 is already pinned inside,
+        but the far corners could still overrun near an edge).
         """
         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
         length = math.hypot(dx, dy)
@@ -662,6 +744,8 @@ class ImageCanvas(QWidget):
             return None, 0.0
         nx, ny = -dy / length, dx / length  # unit perpendicular
         offset = (p3[0] - p1[0]) * nx + (p3[1] - p1[1]) * ny
+        if bounds is not None:
+            offset = ImageCanvas._clamp_perp_offset(p1, p2, nx, ny, offset, bounds)
         tx, ty = nx * offset, ny * offset
         corners = [p1, p2, (p2[0] + tx, p2[1] + ty), (p1[0] + tx, p1[1] + ty)]
         return corners, math.degrees(math.atan2(dy, dx))
@@ -670,6 +754,26 @@ class ImageCanvas(QWidget):
         if self._poly_points:
             self._poly_points.pop()
             self.update()
+
+    def remove_last_point_any(self) -> bool:
+        """Undo the last placed drawing point of the shape in progress.
+
+        Backs off a polygon vertex, or one click of the box state machine (the
+        thickness point of a rotated box, then its centre-line end). Returns True if
+        anything was removed — lets Ctrl+Z step back placements while drawing without
+        touching the committed-object undo history."""
+        if self._poly_points:
+            self._poly_points.pop()
+            self._selected_pending_index = None
+            self.update()
+            return True
+        if self._box_pts:
+            self._box_pts.pop()
+            if len(self._box_pts) < 2:
+                self._box_rotated = False
+            self.update()
+            return True
+        return False
 
     def finish_polygon(self) -> None:
         if self._draw_shape == "polygon" and len(self._poly_points) >= 3:
@@ -756,6 +860,14 @@ class ImageCanvas(QWidget):
             self._set_selected(None)
         self.update()
 
+    def set_draw_active(self, active: bool) -> None:
+        """Mark the Draw pen as armed. In draw mode the working area never selects
+        objects (any click clears the selection), regardless of a class being picked."""
+        self._draw_active = active
+        if active:
+            self._set_selected(None)
+        self.update()
+
     def selected_annotation(self) -> dict | None:
         return self._selected_annotation
 
@@ -838,11 +950,15 @@ class ImageCanvas(QWidget):
         return None
 
     def _begin_label_drag(self, annotation: dict, position) -> None:
-        """Start repositioning ``annotation``'s label; select it so it highlights."""
+        """Start repositioning ``annotation``'s label; select it so it highlights.
+
+        In draw mode the label still repositions, but it must NOT select — the drawing
+        surface stays selection-free."""
         self._label_drag_ann = annotation
         self._label_drag_start = QPointF(position.x(), position.y())
         self._label_drag_origin = QPointF(self._label_offsets.get(id(annotation), QPointF(0.0, 0.0)))
-        self._set_selected(annotation)  # selected = highlighted while you drag the label
+        if not self._draw_active:
+            self._set_selected(annotation)  # selected = highlighted while you drag the label
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def _image_from_screen(self, screen_x: float, screen_y: float, clamp: bool = False) -> tuple[float, float]:
@@ -867,6 +983,19 @@ class ImageCanvas(QWidget):
         if self._pixmap is None:
             return None
         return float(self._pixmap.width()), float(self._pixmap.height())
+
+    def cursor_image_pos(self) -> tuple[float, float] | None:
+        """Current cursor position in image (pixel) coords, or None if it's not over
+        the image right now. Used by paste to drop a copy under the pointer."""
+        if self._pixmap is None:
+            return None
+        local = self.mapFromGlobal(QCursor.pos())
+        if not self.rect().contains(local):
+            return None
+        ix, iy = self._image_from_screen(float(local.x()), float(local.y()))
+        if ix < 0 or iy < 0 or ix > self._pixmap.width() or iy > self._pixmap.height():
+            return None
+        return ix, iy
 
     @staticmethod
     def _corners_in_bounds(points, width: float, height: float, eps: float = 0.5) -> bool:
@@ -1274,8 +1403,37 @@ class ImageCanvas(QWidget):
                 return item
         return None
 
+    def _hit_test_polygon_body(self, position) -> dict | None:
+        """The SELECTED L1/L3 polygon whose body is under the cursor in edit mode, else None.
+
+        Unlike a box (any box body grabs), only the *already-selected* polygon moves on a
+        body press — so a first click on an unselected polygon still just selects it
+        (revealing its vertices), and only a second press-drag on the body moves it whole.
+        A press on a vertex is caught earlier, so it edits that point instead.
+        """
+        if not self._edit_enabled or self._pixmap is None:
+            return None
+        item = self._selected_overlay_item()
+        # True polygons only: an axis box is "bbox"; a rotated L2 quad is a polygon but
+        # rotatable (it has its own whole-box move via _hit_test_box_body).
+        if item is None or item.get("shape") != "polygon" or item.get("rotatable"):
+            return None
+        points = item.get("points") or []
+        if len(points) < 3:
+            return None
+        image_x, image_y, _, _ = self._fit_display_rect()
+        target = QPointF(position.x(), position.y())
+        screen_points = [QPointF(image_x + x * self._zoom, image_y + y * self._zoom) for x, y in points]
+        if QPolygonF(screen_points).containsPoint(target, Qt.FillRule.OddEvenFill):
+            return item
+        return None
+
     def _begin_box_move(self, item: dict, position) -> None:
-        """Select ``item`` and arm a whole-box translate drag (commits past a threshold)."""
+        """Select ``item`` and arm a whole-object translate drag (commits past a threshold).
+
+        Serves both L2 boxes and L1/L3 polygons — the corner list is translated
+        wholesale and written back per shape in :meth:`_apply_box_move`.
+        """
         annotation = item.get("annotation")
         self._set_selected(annotation)  # also reveals the rotate handle
         self._box_move_item = item
@@ -1312,7 +1470,12 @@ class ImageCanvas(QWidget):
         item["points"] = [(px + dx, py + dy) for px, py in self._box_move_origin_points]
         cx, cy = self._box_move_origin_center
         item["center"] = (cx + dx, cy + dy)
-        self._write_translated_box(item)
+        # A true L1/L3 polygon writes its whole (arbitrary-length) contour back; a box
+        # (axis bbox or rotated quad) writes bbox + 4-corner quad.
+        if item.get("shape") == "polygon" and not item.get("rotatable"):
+            self._sync_polygon_geometry(item)
+        else:
+            self._write_translated_box(item)
         self.update()
 
     @staticmethod
@@ -1595,7 +1758,7 @@ class ImageCanvas(QWidget):
                     painter.setBrush(fill)
                     painter.drawRect(QRectF(min(start.x(), end.x()), min(start.y(), end.y()), abs(end.x() - start.x()), abs(end.y() - start.y())))
             elif len(self._box_pts) == 2 and cursor is not None:
-                corners, _ = self._oriented_box(self._box_pts[0], self._box_pts[1], cursor)
+                corners, _ = self._oriented_box(self._box_pts[0], self._box_pts[1], cursor, self._image_bounds())
                 if corners is not None:
                     painter.setPen(pen)
                     painter.setBrush(fill)
@@ -1674,8 +1837,11 @@ class ImageCanvas(QWidget):
         img_h = self._pixmap.height() * self._zoom if self._pixmap is not None else 0.0
         alpha = max(0, min(255, int(round(self.annotation_opacity * 255))))
         point_radius = max(2, int(round(3 * DPI_SCALE)))
+        # User-set label size multiplier (Settings ▸ General). Scales the pill + text
+        # together so they stay proportional; clamped to the slider's 0.5–2.0 range.
+        label_scale = max(0.5, min(2.0, float(getattr(self, "label_scale", 1.0))))
         label_font = QFont()
-        label_font.setPointSizeF(max(9.5, 10.0 * DPI_SCALE))  # +1pt over the old 8.5/9.0
+        label_font.setPointSizeF(max(5.0, 10.0 * DPI_SCALE * label_scale))
         label_font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(label_font)
 
@@ -1698,6 +1864,11 @@ class ImageCanvas(QWidget):
             is_selected = (
                 (self._selected_annotation is not None and item.get("annotation") is self._selected_annotation)
                 or (item.get("pending_redefine") and item is self._selected_redefine)
+            )
+            is_hovered = (
+                not is_selected
+                and self._hover_annotation is not None
+                and item.get("annotation") is self._hover_annotation
             )
             if is_selected:
                 painter.setPen(QPen(QColor(255, 255, 255), max(2.0, 2.4 * DPI_SCALE)))
@@ -1725,6 +1896,19 @@ class ImageCanvas(QWidget):
                 bottom = max(point.y() for point in screen_points)
                 painter.drawRect(QRectF(left, top, right - left, bottom - top))
 
+            # Soft hover ring: a faint white outline over the normal one, clearly
+            # gentler than the selected object's solid, thicker white border.
+            if is_hovered:
+                painter.setPen(QPen(QColor(255, 255, 255, 120), max(1.4, 1.6 * DPI_SCALE)))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                if item["shape"] == "polygon":
+                    hover_path = QPainterPath()
+                    hover_path.addPolygon(QPolygonF(screen_points))
+                    hover_path.closeSubpath()
+                    painter.drawPath(hover_path)
+                else:
+                    painter.drawRect(QRectF(left, top, right - left, bottom - top))
+
             if self.show_points:
                 painter.setBrush(QColor(255, 255, 255))
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -1745,8 +1929,8 @@ class ImageCanvas(QWidget):
             text_width = metrics.horizontalAdvance(label)
             text_height = metrics.height()
             baseline = metrics.ascent()
-            pad_x = max(4, int(round(6 * DPI_SCALE)))
-            pad_y = max(3, int(round(4 * DPI_SCALE)))
+            pad_x = max(3, int(round(6 * DPI_SCALE * label_scale)))
+            pad_y = max(2, int(round(4 * DPI_SCALE * label_scale)))
 
             annotation = item.get("annotation")
             offset = self._label_offsets.get(id(annotation)) if annotation is not None else None
@@ -1787,6 +1971,17 @@ class ImageCanvas(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(color.red(), color.green(), color.blue(), 235))
             painter.drawRoundedRect(box_rect, 4, 4)
+            # Ring the label with the same highlight as its shape — a solid white
+            # border when selected, the softer white ring when merely hovered — so
+            # hovering either the object or its label lights both up.
+            if is_selected:
+                painter.setPen(QPen(QColor(255, 255, 255), max(2.0, 2.4 * DPI_SCALE)))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(box_rect, 4, 4)
+            elif is_hovered:
+                painter.setPen(QPen(QColor(255, 255, 255, 120), max(1.4, 1.6 * DPI_SCALE)))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(box_rect, 4, 4)
 
             # Label text: white glyphs with a thin black outline (the same treatment
             # as the sidebar class pills), so it stays legible on any class colour —
@@ -1855,6 +2050,10 @@ class ImageCanvas(QWidget):
                 return
 
         if event.button() == Qt.MouseButton.LeftButton:
+            # Draw mode: the working area is a pure drawing surface — any click clears
+            # the selection (a Shift+label reposition still works, just won't select).
+            if self._draw_active:
+                self._set_selected(None)
             # The rotate handle of a selected L2 box wins over everything else.
             rotate_item = self._hit_test_rotation_handle(event.position())
             if rotate_item is not None:
@@ -1917,11 +2116,24 @@ class ImageCanvas(QWidget):
             if box_body is not None:
                 self._begin_box_move(box_body, event.position())
                 return
+            # A press on the SELECTED L1/L3 polygon's body (not a vertex) moves it whole.
+            poly_body = self._hit_test_polygon_body(event.position())
+            if poly_body is not None:
+                self._begin_box_move(poly_body, event.position())
+                return
             # Not on a vertex: any other left-click drops the vertex selection.
             self._selected_vertex = None
             # Clicking an annotation body selects it; a parked redefine overlay is
             # selectable too (to assign it a class); empty space deselects, then pans.
             if self._select_enabled:
+                # A plain click on the object's LABEL selects it too, exactly like
+                # clicking the body. Labels paint on top of the shapes, so they win
+                # over a body they happen to overlap. (Shift+click on a label is caught
+                # earlier as a reposition-drag; only view-only labels aren't hit-tested.)
+                label_ann = self._hit_test_label(event.position())
+                if label_ann is not None:
+                    self._set_selected(label_ann)
+                    return
                 annotation = self._hit_test_annotation(event.position())
                 if annotation is not None:
                     self._set_selected(annotation)
@@ -2020,7 +2232,7 @@ class ImageCanvas(QWidget):
                     corners = [(p1[0], p1[1]), (point[0], p1[1]), (point[0], point[1]), (p1[0], point[1])]
                     self.annotationCreated.emit({"shape": "bbox", "points": corners})
         elif len(self._box_pts) == 2 and self._box_rotated:
-            corners, rotation = self._oriented_box(self._box_pts[0], self._box_pts[1], point)
+            corners, rotation = self._oriented_box(self._box_pts[0], self._box_pts[1], point, self._image_bounds())
             self._box_pts = []
             self._box_rotated = False
             if corners is not None:
@@ -2121,8 +2333,23 @@ class ImageCanvas(QWidget):
             snapshot["rotation"] = annotation.get("rotation")
         return snapshot
 
+    def _set_hover_annotation(self, annotation: dict | None) -> None:
+        """Track the object under the cursor for the soft hover highlight (repaint on change)."""
+        if annotation is not self._hover_annotation:
+            self._hover_annotation = annotation
+            self.update()
+
     def _update_hover(self, position) -> None:
         """Highlight the handle under the cursor and switch the cursor shape."""
+        # Soft-highlight the object under the cursor whenever a click there would
+        # select it — never in draw mode (clicks draw) and never the already-selected
+        # object (it already shows the brighter white outline). Hovering the object's
+        # LABEL highlights it too (label painted on top, so it takes precedence).
+        if self._select_enabled and not self._draw_active:
+            hovered = self._hit_test_label(position) or self._hit_test_annotation(position)
+            self._set_hover_annotation(hovered if hovered is not self._selected_annotation else None)
+        else:
+            self._set_hover_annotation(None)
         # The rotate handle (when a rotatable L2 box is selected) takes hover first.
         over_rotation = self._hit_test_rotation_handle(position) is not None
         if over_rotation != self._rotation_hover:
@@ -2153,6 +2380,8 @@ class ImageCanvas(QWidget):
             self.setCursor(self._edge_resize_cursor(edge_hit[0], edge_hit[1]))  # one-side resize
         elif self._hit_test_box_body(position) is not None:
             self.setCursor(Qt.CursorShape.SizeAllCursor)   # a movable L2 box body
+        elif self._hit_test_polygon_body(position) is not None:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)   # a movable selected polygon body
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -2169,10 +2398,89 @@ class ImageCanvas(QWidget):
             return Qt.CursorShape.SizeVerCursor
         return Qt.CursorShape.SizeHorCursor
 
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        # Cursor left the canvas: drop the hover highlight so it doesn't linger.
+        self._set_hover_annotation(None)
+        super().leaveEvent(event)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if self._fit_mode and self._pixmap is not None:
             self.fit_to_view()
+
+
+def _fade_in_window(widget, duration: int = 130) -> None:
+    """Fade a top-level window in from transparent. Keeps a ref on the widget so the
+    animation isn't garbage-collected mid-flight. Safe to call from showEvent — it
+    re-fades on each fresh show but never restarts a fade that is still running."""
+    anim = getattr(widget, "_fade_anim", None)
+    if anim is not None and anim.state() == QPropertyAnimation.State.Running:
+        return
+    widget.setWindowOpacity(0.0)
+    anim = QPropertyAnimation(widget, b"windowOpacity", widget)
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+    widget._fade_anim = anim
+    anim.start()
+
+
+class _ListPopupStyle(QProxyStyle):
+    """Forces the combo drop-down to render as a plain scrollable LIST (with a real
+    scrollbar) instead of the Windows menu-style popup. The menu-style popup draws its
+    own top/bottom scroll-indicator strips — unstyled private widgets that paint WHITE
+    — which was the 'white bar' at the top/bottom of the list. Turning the hint off
+    removes those strips entirely and lets our styled dark scrollbar do the scrolling."""
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None):  # noqa: N802
+        if hint == QStyle.StyleHint.SH_ComboBox_Popup:
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
+
+
+class ImageSelectorComboBox(QComboBox):
+    """The image-picker drop-down. Its popup is a plain OPAQUE dark list (rectangular).
+    We deliberately do NOT use a translucent window for rounded corners: on Windows a
+    translucent frameless popup flashes an opaque black rectangle for one frame every
+    time it is shown (DWM composites the alpha a frame late). Opaque + rectangular has
+    no such flash. The remaining polish — no white menu-style scroller strips, a styled
+    dark scrollbar, a clean border — is set up once via ``configure_popup()``."""
+
+    _DARK = QColor(0x1d, 0x20, 0x24)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # List-style popup (no menu-style white scroller strips) + a bounded height so
+        # it's a normal dropdown that scrolls via the styled scrollbar. NB: construct the
+        # proxy with NO base style — it lazily makes its OWN private copy of the app style.
+        # Passing self.style() would make the proxy take ownership of the SHARED global
+        # style and free it later (segfault).
+        self._proxy_style = _ListPopupStyle()
+        self._proxy_style.setParent(self)
+        self.setStyle(self._proxy_style)
+        self.setMaxVisibleItems(14)
+        # Kill Qt's built-in combo-popup open animation (a scroll/fade effect on Windows)
+        # — that's the residual "blink" as the list appears. We want it to just show.
+        app = QApplication.instance()
+        if app is not None:
+            app.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
+
+    def configure_popup(self) -> None:
+        """Prepare the popup window once, up-front (call right after ``setView``). Keep it
+        OPAQUE (no translucency = no black flash on open) and force its palette dark so no
+        stray white/black shows through."""
+        view = self.view()
+        if view is None:
+            return
+        popup = view.window()
+        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        popup.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+        for w in (view, view.viewport(), popup):
+            pal = w.palette()
+            pal.setColor(QPalette.ColorRole.Base, self._DARK)
+            pal.setColor(QPalette.ColorRole.Window, self._DARK)
+            w.setPalette(pal)
 
 
 class RedefineRowDelegate(QStyledItemDelegate):
@@ -2189,6 +2497,7 @@ class RedefineRowDelegate(QStyledItemDelegate):
     _RED = QColor(255, 86, 96)      # needs redefine (brighter, more visible)
     _AMBER = QColor(255, 184, 41)   # a level is empty (vivid amber/yellow)
     _SELECT = QColor(91, 108, 255)  # selected row pill
+    _BASE = QColor(0x1d, 0x20, 0x24)  # popup background — painted opaquely per row
 
     def sizeHint(self, option, index):  # noqa: N802
         size = super().sizeHint(option, index)
@@ -2199,6 +2508,11 @@ class RedefineRowDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = option.rect
+        # Fill the WHOLE row opaquely first. The delegate otherwise only paints a
+        # rounded inset pill and leaves the surrounding gaps transparent; when the
+        # popup scrolls, Qt bit-blits the old pixels and those transparent regions
+        # smear into white bars. An opaque base fill per row eliminates that.
+        painter.fillRect(rect, self._BASE)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         needs_redefine = bool(index.data(self.FLAG_ROLE))
@@ -2703,10 +3017,13 @@ class ObjectRowButton(QPushButton):
         # Selected -> bright white border so you can tell which object on the canvas
         # this row maps to, without replacing the list. Matches the class pill shape.
         border = "2px solid rgba(255,255,255,0.95)" if self._selected else "1px solid rgba(0,0,0,0.22)"
+        # A selected row keeps its white border on hover (the plain hover border would
+        # otherwise erase the highlight); only unselected rows darken on hover.
+        hover_border = border if self._selected else "1px solid rgba(0,0,0,0.45)"
         self.setStyleSheet(
             f"QPushButton {{ background-color: rgba({c.red()},{c.green()},{c.blue()},{alpha});"
             f" border:{border}; border-radius:11px; }}"
-            " QPushButton:hover { border:1px solid rgba(0,0,0,0.45); }"
+            f" QPushButton:hover {{ border:{hover_border}; }}"
         )
         self.update()
 
@@ -2822,17 +3139,101 @@ class KeyCapButton(QPushButton):
         super().keyReleaseEvent(event)
 
 
-class ShortcutsDialog(QDialog):
-    """Dark-themed help & shortcuts window with inline shortcut rebinding."""
+class ToggleSwitch(QWidget):
+    """A small iOS-style on/off switch (rounded track + sliding knob) in the app's
+    accent scheme. Reusable for any boolean setting. Emits ``toggled(bool)`` on change.
 
-    def __init__(self, owner: "PyQtAnnotationReview") -> None:
+    Public API mirrors a checkable button: ``isChecked()`` / ``setChecked()`` — so it
+    drops in wherever a QCheckBox was used."""
+
+    toggled = pyqtSignal(bool)
+
+    _TRACK_ON = QColor(106, 114, 230)   # accent (matches checked pills / L-buttons)
+    _TRACK_OFF = QColor(74, 79, 87)     # muted grey
+    _KNOB = QColor(255, 255, 255)
+
+    def __init__(self, checked: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._checked = bool(checked)
+        self._pos = 1.0 if self._checked else 0.0  # knob travel, 0 (off) .. 1 (on)
+        self.setFixedSize(max(40, int(round(44 * DPI_SCALE))), max(22, int(round(24 * DPI_SCALE))))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._anim = QPropertyAnimation(self, b"knobPos", self)
+        self._anim.setDuration(130)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool, animate: bool = True) -> None:
+        checked = bool(checked)
+        if checked == self._checked:
+            return
+        self._checked = checked
+        target = 1.0 if checked else 0.0
+        if animate:
+            self._anim.stop()
+            self._anim.setStartValue(self._pos)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self.knobPos = target
+        self.toggled.emit(checked)
+
+    def _get_knob_pos(self) -> float:
+        return self._pos
+
+    def _set_knob_pos(self, value: float) -> None:
+        self._pos = value
+        self.update()
+
+    knobPos = pyqtProperty(float, fget=_get_knob_pos, fset=_set_knob_pos)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+            self.setChecked(not self._checked)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = self.width(), self.height()
+        radius = h / 2.0
+        # Track colour blends between off-grey and on-accent as the knob travels.
+        t = self._pos
+        track = QColor(
+            int(self._TRACK_OFF.red() + (self._TRACK_ON.red() - self._TRACK_OFF.red()) * t),
+            int(self._TRACK_OFF.green() + (self._TRACK_ON.green() - self._TRACK_OFF.green()) * t),
+            int(self._TRACK_OFF.blue() + (self._TRACK_ON.blue() - self._TRACK_OFF.blue()) * t),
+        )
+        if not self.isEnabled():
+            track.setAlpha(110)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)
+        # Knob.
+        margin = max(2.0, 2.0 * DPI_SCALE)
+        diameter = h - 2 * margin
+        x = margin + t * (w - 2 * margin - diameter)
+        painter.setBrush(self._KNOB)
+        painter.drawEllipse(QRectF(x, margin, diameter, diameter))
+        painter.end()
+
+
+class SettingsDialog(QDialog):
+    """Dark-themed Settings window with tabs (General + Shortcuts). The Shortcuts tab
+    keeps the inline shortcut-rebinding UI; General holds app preferences."""
+
+    def __init__(self, owner: "PyQtAnnotationReview", initial_tab: str = "general") -> None:
         super().__init__(owner)
         self._owner = owner
+        self._initial_tab = initial_tab
         self._edit_mode = False
         self._listening_cap: KeyCapButton | None = None
         self._caps: dict[str, KeyCapButton] = {}
         self._clear_btns: dict[str, QPushButton] = {}
-        self.setWindowTitle("Keyboard shortcuts")
+        self.setWindowTitle("Settings")
         self.setModal(True)
         # Wide enough that the longer mouse-gesture rows (description + key cap)
         # aren't clipped on the right.
@@ -2840,6 +3241,10 @@ class ShortcutsDialog(QDialog):
         self._build_ui()
         self._apply_styles()
         self._fit_to_screen()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        _fade_in_window(self)
 
     def _fit_to_screen(self) -> None:
         """Open at a comfortable width/height that never exceeds the screen work area.
@@ -2864,12 +3269,124 @@ class ShortcutsDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
 
-        header_row = QHBoxLayout()
-        title = QLabel("Keyboard shortcuts")
+        title = QLabel("Settings")
         title.setObjectName("dlgHeader")
-        header_row.addWidget(title)
-        header_row.addStretch()
+        layout.addWidget(title)
 
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("settingsTabs")
+        self.tabs.addTab(self._build_general_tab(), "General")
+        self.tabs.addTab(self._build_shortcuts_tab(), "Shortcuts")
+        layout.addWidget(self.tabs, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        self.close_button = QPushButton("Done")
+        self.close_button.setObjectName("primaryButton")
+        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_button.clicked.connect(self.accept)
+        button_row.addWidget(self.close_button)
+        layout.addLayout(button_row)
+
+        # Open on the requested tab (status-bar button lands on Shortcuts).
+        self.tabs.setCurrentIndex(1 if self._initial_tab == "shortcuts" else 0)
+
+    def _build_general_tab(self) -> QWidget:
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        v.setContentsMargins(4, 12, 4, 4)
+        v.setSpacing(12)
+
+        # --- Annotation workflow (legacy/new toggle) ---
+        v.addWidget(self._section_label("Annotation"))
+        legacy_row = QHBoxLayout()
+        legacy_label = QLabel("Legacy draw / edit mode")
+        legacy_label.setObjectName("dlgAction")
+        legacy_row.addWidget(legacy_label)
+        legacy_row.addStretch()
+        self.legacy_switch = ToggleSwitch(self._owner._legacy_mode)
+        self.legacy_switch.toggled.connect(self._owner._on_legacy_mode_toggled)
+        legacy_row.addWidget(self.legacy_switch)
+        v.addLayout(legacy_row)
+        legacy_hint = QLabel(
+            "Off (default): one Draw button — editing is always on, the pen just draws on top.\n"
+            "On: the old separate Draw + Edit buttons (mutually exclusive)."
+        )
+        legacy_hint.setObjectName("dlgAlias")
+        legacy_hint.setWordWrap(True)
+        v.addWidget(legacy_hint)
+
+        # --- Display (label size) ---
+        v.addWidget(self._section_label("Display"))
+        size_row = QHBoxLayout()
+        size_label = QLabel("Label size")
+        size_label.setObjectName("dlgAction")
+        size_row.addWidget(size_label)
+        self.label_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.label_size_slider.setMinimumHeight(max(20, int(round(22 * DPI_SCALE))))
+        self.label_size_slider.setRange(50, 200)
+        self.label_size_slider.setValue(int(round(self._owner.label_scale * 100)))
+        self.label_size_slider.valueChanged.connect(self._on_label_size_changed)
+        self.label_size_slider.sliderReleased.connect(self._on_label_size_released)
+        size_row.addWidget(self.label_size_slider, 1)
+        self.label_size_value = QLabel(f"{int(round(self._owner.label_scale * 100))}%")
+        self.label_size_value.setObjectName("dlgAlias")
+        self.label_size_value.setMinimumWidth(max(38, int(round(42 * DPI_SCALE))))
+        self.label_size_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        size_row.addWidget(self.label_size_value)
+        v.addLayout(size_row)
+
+        # --- Colours (own section so Reset colors isn't buried by the slider) ---
+        v.addWidget(self._section_label("Colours"))
+        colours_row = QHBoxLayout()
+        colours_hint = QLabel("Pick per-class colours on the pills; reset them all here.")
+        colours_hint.setObjectName("dlgAlias")
+        colours_hint.setWordWrap(True)
+        colours_row.addWidget(colours_hint, 1)
+        reset_colors_btn = QPushButton("Reset colors")
+        reset_colors_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_colors_btn.setToolTip("Restore every class to its built-in default colour")
+        reset_colors_btn.clicked.connect(self._owner._reset_colors_to_default)
+        colours_row.addWidget(reset_colors_btn)
+        v.addLayout(colours_row)
+
+        v.addStretch(1)
+
+        # --- Help + logs at the bottom ---
+        bottom = QHBoxLayout()
+        help_btn = QPushButton("Help")
+        help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        help_btn.setToolTip("How the project / levels / modes / editing workflow fits together")
+        help_btn.clicked.connect(self._owner._show_workflow_help)
+        bottom.addWidget(help_btn)
+        logs_btn = QPushButton("Open logs folder")
+        logs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        logs_btn.clicked.connect(self._owner._open_logs_folder)
+        bottom.addWidget(logs_btn)
+        bottom.addStretch()
+        v.addLayout(bottom)
+        return tab
+
+    def _on_label_size_changed(self, value: int) -> None:
+        self.label_size_value.setText(f"{value}%")
+        self._owner._apply_label_scale(value / 100.0)  # live preview, no write yet
+
+    def _on_label_size_released(self) -> None:
+        self._owner._persist_setting("label_scale", self._owner.label_scale)
+
+    def _build_shortcuts_tab(self) -> QWidget:
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        v.setContentsMargins(0, 10, 0, 0)
+        v.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        header_row.addStretch()
+        self.reset_button = QPushButton("Reset to defaults")
+        self.reset_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reset_button.setToolTip("Restore the built-in keyboard shortcuts")
+        self.reset_button.clicked.connect(self._reset_defaults)
+        header_row.addWidget(self.reset_button)
         self.edit_button = QPushButton("Edit")
         self.edit_button.setObjectName("toggleButton")
         self.edit_button.setCheckable(True)
@@ -2877,13 +3394,13 @@ class ShortcutsDialog(QDialog):
         self.edit_button.setToolTip("Edit shortcuts: click a key, then press a new one")
         self.edit_button.toggled.connect(self._on_edit_toggled)
         header_row.addWidget(self.edit_button)
-        layout.addLayout(header_row)
+        v.addLayout(header_row)
 
         self.banner = QLabel("")
         self.banner.setObjectName("dlgBanner")
         self.banner.setWordWrap(True)
         self.banner.setVisible(False)
-        layout.addWidget(self.banner)
+        v.addWidget(self.banner)
 
         # The shortcut list can be taller than the screen (many rows + high-DPI),
         # which made the dialog request an oversized window that Windows clamps
@@ -2907,7 +3424,7 @@ class ShortcutsDialog(QDialog):
             ("Drag empty space", "pan"),
             ("Click an object (Edit)", "select it — only the selected object shows handles"),
             ("Drag a handle (Edit)", "move a box corner / polygon vertex of the selected object"),
-            ("Drag an L2 box body (Edit)", "move the whole box; its round handle rotates it"),
+            ("Drag a selected object's body (Edit)", "move the whole box/polygon; an L2 box's round handle rotates it"),
             ("Click a vertex (Edit)", "select it; Delete/Backspace removes it (polygons only)"),
             ("Right-click (Edit)", "add a polygon vertex on the nearest edge"),
             ("Drag a point while drawing", "move it; click an existing point to select, Delete removes"),
@@ -2921,21 +3438,8 @@ class ShortcutsDialog(QDialog):
 
         content_layout.addStretch()
         scroll.setWidget(content)
-        layout.addWidget(scroll, 1)
-
-        button_row = QHBoxLayout()
-        self.reset_button = QPushButton("Reset to defaults")
-        self.reset_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.reset_button.setToolTip("Restore the built-in keyboard shortcuts")
-        self.reset_button.clicked.connect(self._reset_defaults)
-        button_row.addWidget(self.reset_button)
-        button_row.addStretch()
-        self.close_button = QPushButton("Done")
-        self.close_button.setObjectName("primaryButton")
-        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_button.clicked.connect(self.accept)
-        button_row.addWidget(self.close_button)
-        layout.addLayout(button_row)
+        v.addWidget(scroll, 1)
+        return tab
 
     def _section_label(self, text: str) -> QLabel:
         label = QLabel(text.upper())
@@ -3188,6 +3692,52 @@ class ShortcutsDialog(QDialog):
                 color: #ffffff;
                 font-weight: 600;
             }}
+            QTabWidget#settingsTabs::pane {{
+                border: 1px solid #2f333a;
+                border-radius: 8px;
+                top: -1px;
+            }}
+            QTabWidget#settingsTabs > QTabBar {{
+                qproperty-drawBase: 0;
+            }}
+            QTabWidget#settingsTabs QTabBar::tab {{
+                background: #24272d;
+                color: #b9bec7;
+                border: 1px solid #2f333a;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 6px 18px;
+                margin-right: 2px;
+            }}
+            QTabWidget#settingsTabs QTabBar::tab:selected {{
+                background: #2f3340;
+                color: #ffffff;
+                border-bottom-color: #2f3340;
+            }}
+            QTabWidget#settingsTabs QTabBar::tab:hover {{
+                color: #eef0f3;
+            }}
+            QTabWidget#settingsTabs QWidget {{
+                background: #1c1f24;
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: #3a4048;
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: #6a72e6;
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: #ffffff;
+                width: 14px;
+                margin: -6px 0;
+                border-radius: 7px;
+            }}
+            QSlider::handle:horizontal:hover {{
+                background: #e8e8ee;
+            }}
             """
         )
 
@@ -3414,6 +3964,10 @@ class RedefineDialog(QDialog):
         button_row.addWidget(apply_button)
         layout.addLayout(button_row)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        _fade_in_window(self)
+
     def mappings(self) -> dict[str, tuple[int, str]]:
         """{raw_class: (level, target_class)} for pickers with BOTH chosen."""
         result: dict[str, tuple[int, str]] = {}
@@ -3470,6 +4024,10 @@ class ClassListWindow(QDialog):
         self.scroll.setObjectName("classScroll")
         layout.addWidget(self.scroll)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        _fade_in_window(self)
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self.closed.emit()
         super().closeEvent(event)
@@ -3510,6 +4068,10 @@ class CanvasWindow(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self._layout = layout
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        _fade_in_window(self)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         # Let the main window's shortcut dispatch handle navigation etc.
@@ -3585,6 +4147,77 @@ def _install_button_space_swallower() -> None:
     app.installEventFilter(_BUTTON_SPACE_SWALLOWER)
 
 
+class ActionPickerDialog(QDialog):
+    """Compact chooser window: a tight list of actions, each a small action button with
+    a short description beside it. Picking one closes the window and records ``chosen``
+    (the action id); the caller runs the matching handler after ``exec()``.
+
+    Shared by the Import and Project top-bar windows so they look and feel identical."""
+
+    def __init__(self, owner: "PyQtAnnotationReview", window_title: str,
+                 actions: list[tuple[str, str, str, bool]]) -> None:
+        super().__init__(owner)
+        self.chosen: str | None = None
+        self.setObjectName("pickerDialog")
+        self.setWindowTitle(window_title)
+        self.setModal(True)
+        self.setMinimumWidth(max(420, int(round(460 * DPI_SCALE))))
+        self.setStyleSheet(
+            _DARK_DIALOG_QSS
+            + "#pickerDialog { background: #1c1f24; }"
+            + "#pickerDialog QLabel#pickDesc { color: #9aa0ab; }"
+            + "#pickerDialog QPushButton#pickAction { text-align: left; padding: 6px 12px;"
+            "  border-radius: 7px; background: #2f3340; border: 1px solid #3d4350; font-weight: 600; }"
+            + "#pickerDialog QPushButton#pickAction:hover { background: #363b4a; border-color: #565d94; }"
+            + "#pickerDialog QPushButton#pickAction:disabled { background: #24272d; color: #6b7078; border-color: #2f333a; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(9)
+        action_buttons: list[QPushButton] = []
+        for action_id, label, desc, enabled in actions:
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+            button = QPushButton(label)
+            button.setObjectName("pickAction")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setEnabled(enabled)
+            button.clicked.connect(lambda _=False, a=action_id: self._pick(a))
+            action_buttons.append(button)
+            row.addWidget(button)
+            hint = QLabel(desc)
+            hint.setObjectName("pickDesc")
+            hint.setWordWrap(True)
+            row.addWidget(hint, 1)
+            layout.addLayout(row)
+
+        # Make every action button the same width as the WIDEST one, using sizeHint()
+        # (which the style computes from the real rendered font + the QSS padding), so the
+        # longest label — "Open annotations (JSON)" — can never clip. A little slack on top.
+        if action_buttons:
+            widest = max(b.sizeHint().width() for b in action_buttons)
+            widest = max(widest + int(round(6 * DPI_SCALE)), 150, int(round(168 * DPI_SCALE)))
+            for b in action_buttons:
+                b.setFixedWidth(widest)
+
+        cancel_row = QHBoxLayout()
+        cancel_row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        cancel_row.addWidget(cancel)
+        layout.addLayout(cancel_row)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        _fade_in_window(self)
+
+    def _pick(self, action_id: str) -> None:
+        self.chosen = action_id
+        self.accept()  # close first; the caller runs the handler after exec()
+
+
 class PyQtAnnotationReview(QMainWindow):
     """Main PyQt window that mirrors the previous OpenCV app behavior."""
 
@@ -3594,9 +4227,14 @@ class PyQtAnnotationReview(QMainWindow):
         super().__init__()
         self.input_path = input_path
 
-        self.show_points = False
-        self.show_labels = True
-        self.annotation_opacity = 0.30
+        # All persisted user settings live in one dict (settings.json in the local app
+        # folder). Read once here; `_persist_setting` writes changes back.
+        self._settings = load_app_settings()
+        self.show_points = bool(self._settings.get("show_points", False))
+        self.show_labels = bool(self._settings.get("show_labels", True))
+        self.annotation_opacity = float(self._settings.get("opacity", 0.30))
+        # On-canvas label size multiplier (1.0 = default; slider spans 0.5–2.0).
+        self.label_scale = float(self._settings.get("label_scale", 1.0))
         # Set True once any annotation vertex has been dragged; cleared on load.
         self._dirty = False
         # Which level files have unsaved edits (per-level dirty tracking). The
@@ -3607,6 +4245,11 @@ class PyQtAnnotationReview(QMainWindow):
         self._last_saved_at: float | None = None
         # True while the sidebar shows the redefine "assign a class" catalog panel.
         self._redefine_panel_active = False
+        # Annotation workflow structure. Default (False) = the new single-"Draw" model:
+        # editing is always on, the pen just toggles drawing on top. True = the legacy
+        # two-button model (separate Draw / Edit objects toggles, mutually exclusive).
+        # Only affects ANNOTATION mode; validation is identical either way.
+        self._legacy_mode = bool(self._settings.get("legacy_draw_edit", False))
         # The currently-running background import (QThread), or None. One at a time.
         self._bg_task = None
         # Per-object visibility + rollout (session-only; cleared on image/level change).
@@ -3625,10 +4268,17 @@ class PyQtAnnotationReview(QMainWindow):
         # Undo/redo history of geometry edit records ({annotation, before, after, image_index}).
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
+        # Copy/paste buffer: a deep-copied annotation + the level it came from. Paste
+        # duplicates it onto that level (Ctrl+C / Ctrl+V).
+        self._clipboard: dict | None = None
 
         # Validation (review) vs annotation (draw) mode. Validation is the default tool.
         self.mode = "validation"
         self.annotation_level = levels.LEVEL_IDS[0]
+        # Extra levels layered (read-only) over the active one via Shift+clicking a
+        # level button — lets you view several levels' objects at once. A plain click
+        # clears these and returns to the single active level.
+        self._extra_overlay_levels: set[int] = set()
         # Per-level "active" drawing class id (single-select). None = nothing selected.
         self.active_category_by_level: dict[int, int | None] = {lvl: None for lvl in levels.LEVEL_IDS}
         # Annotation-mode stores: level -> {image basename -> [annotation dicts]}.
@@ -3708,10 +4358,13 @@ class PyQtAnnotationReview(QMainWindow):
             ("undo", "Undo", "Ctrl+Z", [], self._undo),
             ("redo", "Redo", "Ctrl+Y", [], self._redo),
             ("save", "Save", "Ctrl+S", [], self._save_dataset),
+            ("copy_object", "Copy selected object", "Ctrl+C", [], self._copy_selected_annotation),
+            ("paste_object", "Paste object", "Ctrl+V", [], self._paste_annotation),
             ("open", "Open", "", [], self._open_shortcut),
             ("toggle_mode", "Switch validation/annotate", "", [], self._toggle_mode),
-            ("toggle_draw", "Toggle draw (annotate)", "", [], self._toggle_draw_shortcut),
-            ("toggle_edit", "Toggle edit objects", "", [], self._toggle_edit_shortcut),
+            # One tool toggle, mode-aware: in annotate it toggles Draw; in validation it
+            # toggles Edit objects. (Replaces the old separate draw/edit shortcuts.)
+            ("toggle_tool", "Toggle draw / edit", "", [], self._toggle_tool_shortcut),
             ("level_1", "Annotate level 1", "", [], lambda: self._shortcut_level(1)),
             ("level_2", "Annotate level 2", "", [], lambda: self._shortcut_level(2)),
             ("level_3", "Annotate level 3", "", [], lambda: self._shortcut_level(3)),
@@ -3752,7 +4405,7 @@ class PyQtAnnotationReview(QMainWindow):
                     index[alias] = action_id
         self._shortcut_index = index
 
-    # Accessors used by ShortcutsDialog.
+    # Accessors used by SettingsDialog (Shortcuts tab).
     def shortcut_order(self) -> list[str]:
         return list(self._shortcut_order)
 
@@ -3930,15 +4583,17 @@ class PyQtAnnotationReview(QMainWindow):
         level_row.setContentsMargins(0, 0, 0, 0)
         level_row.setSpacing(6)
         self.level_group = QButtonGroup(self)
-        self.level_group.setExclusive(True)
+        # Non-exclusive so Shift+click can layer several levels' overlays at once
+        # (multiple buttons checked). Check-states are managed via _refresh_level_button_states.
+        self.level_group.setExclusive(False)
         self.level_buttons: dict[int, QPushButton] = {}
         for level_id in levels.LEVEL_IDS:
             level_button = QPushButton(f"L{level_id}")
             level_button.setObjectName("toggleButton")
             level_button.setCheckable(True)
             level_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            level_button.setToolTip(f"Level {level_id} — {levels.level_title(level_id)}")
-            level_button.clicked.connect(lambda _checked=False, lvl=level_id: self._set_level(lvl))
+            level_button.setToolTip(f"Level {level_id} — {levels.level_title(level_id)}  (Shift+click to overlay it on the current level)")
+            level_button.clicked.connect(lambda _checked=False, lvl=level_id: self._on_level_button_clicked(lvl))
             self.level_group.addButton(level_button)
             self.level_buttons[level_id] = level_button
             level_row.addWidget(level_button, 1)
@@ -3975,7 +4630,7 @@ class PyQtAnnotationReview(QMainWindow):
         self.redo_button.clicked.connect(self._redo)
         header_row.addWidget(self.redo_button)
 
-        self.image_selector = QComboBox()
+        self.image_selector = ImageSelectorComboBox()
         self.image_selector.setMaximumWidth(200)
         self.image_selector.setPlaceholderText("Select image")
         image_selector_view = QListView()
@@ -3991,15 +4646,30 @@ class PyQtAnnotationReview(QMainWindow):
         image_selector_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         image_selector_view.setAutoFillBackground(True)
         image_selector_view.viewport().setAutoFillBackground(True)
+        # autoFillBackground paints from the PALETTE (Base/Window default to WHITE),
+        # not the stylesheet — that white is what smears into bars while the popup
+        # scrolls. Force the palette dark so any autofill/blit stays on-theme.
+        _list_pal = image_selector_view.palette()
+        _dark = QColor(0x1d, 0x20, 0x24)
+        for _role in (QPalette.ColorRole.Base, QPalette.ColorRole.Window):
+            _list_pal.setColor(_role, _dark)
+        _list_pal.setColor(QPalette.ColorRole.Text, QColor(0xf4, 0xf4, 0xf5))
+        image_selector_view.setPalette(_list_pal)
+        image_selector_view.viewport().setPalette(_list_pal)
+        # Scroll per pixel + repaint the whole viewport on every scroll step so Qt
+        # never bit-blits stale rows (the source of the trailing white bars).
+        image_selector_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        image_selector_view.verticalScrollBar().valueChanged.connect(
+            image_selector_view.viewport().update
+        )
         image_selector_view.setStyleSheet(
             """
             QListView {
                 background: #1d2024;
                 color: #f4f4f5;
-                border-left: 1px solid #5a606a;
-                border-right: 1px solid #5a606a;
+                border: none;
                 outline: none;
-                padding: 5px 0px;
+                padding: 0px;
                 margin: 0px;
             }
             QListView::item {
@@ -4018,6 +4688,27 @@ class PyQtAnnotationReview(QMainWindow):
                 margin: 0px;
                 padding: 0px;
             }
+            QListView QScrollBar:vertical {
+                background: #1d2024;
+                width: 11px;
+                margin: 4px 3px 4px 0px;
+            }
+            QListView QScrollBar::handle:vertical {
+                background: #3a3f46;
+                border-radius: 5px;
+                min-height: 28px;
+            }
+            QListView QScrollBar::handle:vertical:hover {
+                background: #4a4f57;
+            }
+            QListView QScrollBar::add-line:vertical,
+            QListView QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QListView QScrollBar::add-page:vertical,
+            QListView QScrollBar::sub-page:vertical {
+                background: #1d2024;
+            }
             """
         )
         image_selector_view.setItemDelegate(RedefineRowDelegate(image_selector_view))
@@ -4025,27 +4716,33 @@ class PyQtAnnotationReview(QMainWindow):
         popup = self.image_selector.view().window()
         popup.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         popup.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
-        popup.setAutoFillBackground(True)
-        popup.setContentsMargins(0, 0, 0, 0)
-        popup.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # OPAQUE popup (no translucency → no black flash on open). A subtle 1px border
+        # defines the rectangular dark card against the app behind it.
+        popup.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
         popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        _popup_pal = popup.palette()
+        for _role in (QPalette.ColorRole.Base, QPalette.ColorRole.Window):
+            _popup_pal.setColor(_role, _dark)
+        popup.setPalette(_popup_pal)
         if hasattr(popup, "setFrameShape"):
             popup.setFrameShape(QFrame.Shape.NoFrame)
             popup.setLineWidth(0)
             popup.setMidLineWidth(0)
+        popup.setContentsMargins(0, 0, 0, 0)
         popup.setStyleSheet(
             """
             QFrame {
                 background: #1d2024;
-                border: none;
-                margin: 0px;
-                padding: 0px;
+                border: 1px solid #5a606a;
             }
             """
         )
         if popup.layout() is not None:
             popup.layout().setContentsMargins(0, 0, 0, 0)
             popup.layout().setSpacing(0)
+        # Final up-front hardening (opaque + dark palette on view/viewport/popup), done
+        # before the popup is ever shown so the first open is clean.
+        self.image_selector.configure_popup()
         self.image_selector._pixmap = None
         self.image_selector._fit_mode = False
         self.image_selector._zoom = 1.0
@@ -4109,10 +4806,14 @@ class PyQtAnnotationReview(QMainWindow):
         # Tall enough that the round handle (which overflows the groove) isn't clipped.
         self.opacity_slider.setMinimumHeight(max(20, int(round(22 * DPI_SCALE))))
         self.opacity_slider.setRange(0, 100)
-        self.opacity_slider.setValue(30)
+        self.opacity_slider.setValue(int(round(self.annotation_opacity * 100)))  # before connect: no fire
         self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        # Persist on release only (not on every drag tick, to avoid hammering the file).
+        self.opacity_slider.sliderReleased.connect(
+            lambda: self._persist_setting("opacity", self.opacity_slider.value() / 100.0)
+        )
         opacity_row.addWidget(self.opacity_slider, 1)
-        self.opacity_value_label = QLabel("30%")
+        self.opacity_value_label = QLabel(f"{int(round(self.annotation_opacity * 100))}%")
         self.opacity_value_label.setObjectName("muted")
         self.opacity_value_label.setMinimumWidth(max(34, int(round(36 * DPI_SCALE))))
         self.opacity_value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -4131,7 +4832,7 @@ class PyQtAnnotationReview(QMainWindow):
         self.edit_objects_button.setObjectName("toggleButton")
         self.edit_objects_button.setCheckable(True)
         self.edit_objects_button.setChecked(False)
-        self.edit_objects_button.setToolTip("Toggle editing of box corners / polygon vertices (assign a key in Settings ▸ Keyboard shortcuts)")
+        self.edit_objects_button.setToolTip("Toggle editing of box corners / polygon vertices (assign a key to 'Toggle draw / edit' in Settings ▸ Shortcuts)")
         self.edit_objects_button.toggled.connect(self._on_edit_objects_toggled)
 
         self.delete_button = QPushButton("✕")  # white cross
@@ -4144,20 +4845,19 @@ class PyQtAnnotationReview(QMainWindow):
         self.delete_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_button.clicked.connect(self._delete_selected_annotation)
 
-        self.labels_checkbox = QCheckBox("Show labels")
-        self.labels_checkbox.setChecked(True)
-        self.labels_checkbox.stateChanged.connect(self._on_labels_toggled)
-        self.reset_colors_button = QPushButton("Reset colors")
-        self.reset_colors_button.clicked.connect(self._reset_colors_to_default)
+        # "Show labels" is now a switch on the right (Reset colors moved to Settings).
+        self.labels_switch = ToggleSwitch(self.show_labels)
+        self.labels_switch.toggled.connect(self._on_labels_toggled)
+        labels_label = QLabel("Show labels")
 
         toggle_row = QHBoxLayout()
         toggle_row.setSpacing(6)
         toggle_row.addWidget(self.draw_button)
         toggle_row.addWidget(self.edit_objects_button)
         toggle_row.addWidget(self.delete_button)
-        toggle_row.addWidget(self.labels_checkbox)
         toggle_row.addStretch()
-        toggle_row.addWidget(self.reset_colors_button)
+        toggle_row.addWidget(labels_label)
+        toggle_row.addWidget(self.labels_switch)
         sidebar_layout.addLayout(toggle_row)
 
         self.class_list_container = QWidget()
@@ -4237,57 +4937,40 @@ class PyQtAnnotationReview(QMainWindow):
 
     # ----- project: menu bar, welcome screen, open/close -------------------
     def _build_menu_bar(self) -> None:
-        """Top menu bar: Project / Import / Settings (the project control surface)."""
+        """Top bar: Project / Import / Settings — each a click that opens a window."""
         bar = self.menuBar()
 
-        project_menu = bar.addMenu("&Project")
+        # The project QActions are kept (for their enabled-state, which the welcome
+        # buttons + chrome track, and the tests read) but presented via a WINDOW rather
+        # than a dropdown, so the whole top bar is a consistent "opens a window" set.
         self.action_new_project = QAction("New project…", self)
         self.action_new_project.triggered.connect(self._new_project)
-        project_menu.addAction(self.action_new_project)
         self.action_open_project = QAction("Open project…", self)
         self.action_open_project.triggered.connect(self._open_project)
-        project_menu.addAction(self.action_open_project)
-        project_menu.addSeparator()
         self.action_close_project = QAction("Close project", self)
         self.action_close_project.triggered.connect(self._close_project)
-        project_menu.addAction(self.action_close_project)
         self.action_export_zip = QAction("Export as zip…", self)
-        self.action_export_zip.setToolTip("Bundle the whole project (images + level JSONs) into one shareable zip")
         self.action_export_zip.triggered.connect(self._export_project_zip)
         self.action_export_zip.setEnabled(False)
-        project_menu.addAction(self.action_export_zip)
-        project_menu.addSeparator()
         self.action_redefine = QAction("Redefine classes…", self)
-        self.action_redefine.setToolTip("Assign imported off-catalog classes to a level + existing class")
         self.action_redefine.triggered.connect(self._open_redefine_dialog)
         self.action_redefine.setEnabled(False)
-        project_menu.addAction(self.action_redefine)
 
-        # Import actions only make sense inside an open project. Zip is first:
-        # it is the fullest import (images + annotation JSONs in one archive).
-        self.import_menu = bar.addMenu("&Import")
-        self.action_import_zip = QAction("Open zip…", self)
-        self.action_import_zip.setToolTip("Import an export zip (images + annotation JSONs)")
-        self.action_import_zip.triggered.connect(self._import_zip)
-        self.import_menu.addAction(self.action_import_zip)
-        self.action_import_images = QAction("Open image folder…", self)
-        self.action_import_images.triggered.connect(self._import_image_folder)
-        self.import_menu.addAction(self.action_import_images)
-        self.action_import_annotations = QAction("Open annotations…", self)
-        self.action_import_annotations.setToolTip("Import annotation JSON(s) — available once the project has images")
-        self.action_import_annotations.triggered.connect(self._import_annotations)
-        self.import_menu.addAction(self.action_import_annotations)
+        self.project_action = QAction("&Project", self)
+        self.project_action.setToolTip("New / open / close project, export, redefine classes")
+        self.project_action.triggered.connect(self._open_project_window)
+        bar.addAction(self.project_action)
 
-        settings_menu = bar.addMenu("&Settings")
-        workflow_action = QAction("How it works…", self)
-        workflow_action.triggered.connect(self._show_workflow_help)
-        settings_menu.addAction(workflow_action)
-        shortcuts_action = QAction("Keyboard shortcuts…", self)
-        shortcuts_action.triggered.connect(self._show_help)
-        settings_menu.addAction(shortcuts_action)
-        logs_action = QAction("Open logs folder…", self)
-        logs_action.triggered.connect(self._open_logs_folder)
-        settings_menu.addAction(logs_action)
+        self.import_action = QAction("&Import", self)
+        self.import_action.setToolTip("Import images, a Label Studio zip, or annotation JSONs (needs an open project)")
+        self.import_action.triggered.connect(self._open_import_window)
+        self.import_action.setEnabled(False)
+        bar.addAction(self.import_action)
+
+        self.settings_action = QAction("&Settings", self)
+        self.settings_action.setToolTip("App settings, label size, and keyboard shortcuts")
+        self.settings_action.triggered.connect(self._show_settings)
+        bar.addAction(self.settings_action)
 
     def _build_welcome_page(self) -> QWidget:
         """The opening screen shown when no project is open."""
@@ -4425,7 +5108,7 @@ class PyQtAnnotationReview(QMainWindow):
         # Leaving the working view: pull a detached canvas back so it can't linger.
         if not has_project and getattr(self, "canvas_popout", None) is not None:
             self.canvas_popout.close()
-        # view_stack/import_menu exist only after _build_ui has created them.
+        # view_stack/import_action exist only after _build_ui has created them.
         if hasattr(self, "view_stack"):
             self.view_stack.setCurrentIndex(1 if has_project else 0)
         if hasattr(self, "action_close_project"):
@@ -4434,10 +5117,10 @@ class PyQtAnnotationReview(QMainWindow):
             self.action_export_zip.setEnabled(has_project)
         if hasattr(self, "export_zip_button"):
             self.export_zip_button.setVisible(has_project)
-        if hasattr(self, "import_menu"):
-            self.import_menu.setEnabled(has_project)
-            # Annotations need images to attach to: greyed until the project has any.
-            self.action_import_annotations.setEnabled(has_images)
+        if hasattr(self, "import_action"):
+            # Import needs an open project; the window itself greys the annotations
+            # option until the project has images.
+            self.import_action.setEnabled(has_project)
         if has_project:
             counts = self.project.level_counts()
             total = sum(counts.values())
@@ -4721,8 +5404,8 @@ class PyQtAnnotationReview(QMainWindow):
             return False
         self.status_label.setText(message)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        if hasattr(self, "import_menu"):
-            self.import_menu.setEnabled(False)  # no overlapping imports
+        if hasattr(self, "import_action"):
+            self.import_action.setEnabled(False)  # no overlapping imports
         task = _BackgroundTask(work)
         task._done_cb = done  # type: ignore[attr-defined]
         self._bg_task = task
@@ -4736,7 +5419,7 @@ class PyQtAnnotationReview(QMainWindow):
     def _handle_bg_done(self, result, error) -> None:
         """UI-thread completion handler for a background task (restores chrome, runs cb)."""
         QApplication.restoreOverrideCursor()
-        if hasattr(self, "import_menu"):
+        if hasattr(self, "import_action"):
             self._update_project_chrome()  # re-enables Import per project/has-images state
         task = self._bg_task
         self._bg_task = None
@@ -5231,13 +5914,31 @@ class PyQtAnnotationReview(QMainWindow):
                 background: #1c1f24;
                 color: #e6e8ec;
                 border-bottom: 1px solid #3a4048;
+                padding: 4px 6px;
+                spacing: 4px;
             }}
+            /* Top-bar entries styled as pill buttons to match the dialog buttons. */
             QMenuBar::item {{
-                background: transparent;
-                padding: 5px 12px;
+                background: #2a2e35;
+                border: 1px solid #3a4048;
+                color: #e6e8ec;
+                padding: 5px 14px;
+                margin: 2px;
+                border-radius: 7px;
             }}
             QMenuBar::item:selected {{
-                background: #2f343c;
+                background: #3a4048;
+                border-color: #4e545d;
+            }}
+            QMenuBar::item:pressed {{
+                background: #6a72e6;
+                border-color: #6a72e6;
+                color: #ffffff;
+            }}
+            QMenuBar::item:disabled {{
+                background: #23262c;
+                border-color: #2f343c;
+                color: #6b707a;
             }}
             QMenu {{
                 background: #1d2024;
@@ -5308,6 +6009,15 @@ class PyQtAnnotationReview(QMainWindow):
             }}
             QPushButton#toggleButton:checked:hover {{
                 background: #7780f0;
+            }}
+            QPushButton#toggleButton[secondaryLevel="true"]:checked {{
+                background: #3f4570;
+                border: 1px solid #565d94;
+                color: #cdd2f2;
+                font-weight: 500;
+            }}
+            QPushButton#toggleButton[secondaryLevel="true"]:checked:hover {{
+                background: #474d7d;
             }}
             QPushButton#dangerButton {{
                 background: #c0392b;
@@ -5552,7 +6262,9 @@ class PyQtAnnotationReview(QMainWindow):
     def _on_object_row_activated(self, annotation: dict, shift: bool) -> None:
         """A per-object row was clicked: Shift selects it, a plain click toggles visibility."""
         if shift:
-            self.canvas._set_selected(annotation)  # select, like clicking it on the canvas
+            # No selecting while the Draw pen is armed — it stays a pure drawing surface.
+            if not self.draw_button.isChecked():
+                self.canvas._set_selected(annotation)  # select, like clicking it on the canvas
             return
         category_id = annotation.get("category_id")
         key = id(annotation)
@@ -5792,6 +6504,11 @@ class PyQtAnnotationReview(QMainWindow):
             self.canvas.clear_selection()
             if self._redefine_panel_active:
                 self._restore_normal_class_list()
+        # Draw mode disables whole-object selection (clicks draw instead); restore it
+        # when the pen goes back up. In the new model the pen also gates editing, so
+        # keep the canvas edit state in step.
+        self._update_select_enabled()
+        self._sync_edit_enabled()
         self._sync_draw_state()
         # The pills mean different things with the pen up vs down (visibility toggle
         # vs active-draw-class), and Show/Hide-all only apply to visibility, so rebuild
@@ -5799,6 +6516,14 @@ class PyQtAnnotationReview(QMainWindow):
         self._update_class_action_visibility()
         if self.mode == "annotation" and not self._redefine_panel_active:
             self._populate_level_classes()
+        # Entering draw mode reveals every class (like clicking "Show all"), so a fresh
+        # drawing surface isn't hiding existing objects from earlier hide toggles.
+        if checked:
+            self._show_all_classes()
+        # New model: dropping the pen re-enables editing, so refresh the selection
+        # sidebar (Delete button / change-class panel) to match.
+        if not checked and self.mode == "annotation" and not self._legacy_mode:
+            self._on_selection_changed()
 
     def _sync_draw_state(self) -> None:
         """Tell the canvas what (if anything) to draw, based on mode/level/active class."""
@@ -5816,8 +6541,9 @@ class PyQtAnnotationReview(QMainWindow):
         shape = "polygon" if geometry == levels.GEOMETRY_POLYGON else "bbox"
         self.canvas.set_draw_shape(shape, (color.red(), color.green(), color.blue()))
 
-    def _on_labels_toggled(self, state: int) -> None:
-        self.show_labels = state == int(Qt.CheckState.Checked.value)
+    def _on_labels_toggled(self, checked: bool) -> None:
+        self.show_labels = bool(checked)
+        self._persist_setting("show_labels", self.show_labels)
         self._sync_canvas_state()
         self.canvas.update()
 
@@ -5851,8 +6577,13 @@ class PyQtAnnotationReview(QMainWindow):
             self._populate_class_checkboxes()
 
     def _show_all_classes(self) -> None:
+        # With the pen down the pills show the active draw class (single-select), so
+        # never force them all checked — just flip the underlying visibility + overlays.
+        pen_down = self._pen_is_down()
         for category_id in self._visibility_category_ids():
             self.visible_by_category[category_id] = True
+            if pen_down:
+                continue
             bubble = self.class_checkboxes.get(category_id)
             if bubble is not None:
                 bubble.blockSignals(True)
@@ -5869,8 +6600,11 @@ class PyQtAnnotationReview(QMainWindow):
         self._refresh_overlay_items()
 
     def _hide_all_classes(self) -> None:
+        pen_down = self._pen_is_down()
         for category_id in self._visibility_category_ids():
             self.visible_by_category[category_id] = False
+            if pen_down:
+                continue
             bubble = self.class_checkboxes.get(category_id)
             if bubble is not None:
                 bubble.blockSignals(True)
@@ -5900,15 +6634,25 @@ class PyQtAnnotationReview(QMainWindow):
         self.visible_by_category = {}
         self.annotation_store = {lvl: {} for lvl in levels.LEVEL_IDS}
         self.annotation_root = ""
+        self._extra_overlay_levels = set()  # drop any Shift+click level overlays
         self._undo_stack = []
         self._redo_stack = []
+        self._clipboard = None
         self._dirty = False
 
+    def _pen_is_down(self) -> bool:
+        """True while the drawing pen is armed (annotation mode + Draw toggled on).
+
+        In this state the class pills single-select the active DRAW class rather than
+        toggle visibility, so anything that flips pill check-states must skip them."""
+        return self.mode == "annotation" and self.draw_button.isChecked()
+
     def _update_class_action_visibility(self) -> None:
-        """Show the Show-all / Hide-all buttons whenever the class pills act as
-        visibility toggles — i.e. any time the pen is up (validation, or annotate in
-        no/edit mode). In draw mode the pills pick the active class, so they're hidden."""
-        self.class_action_widget.setVisible(not self.draw_button.isChecked())
+        """Show-all / Hide-all are always available: they act on class *visibility*
+        (whether existing objects render), which is independent of whether the pen is
+        up or down. In draw mode the pills pick the active class, but the two buttons
+        still toggle overlay visibility, so keep them visible there too."""
+        self.class_action_widget.setVisible(True)
 
     def _apply_mode_chrome(self) -> None:
         """Show/hide the mode- and project-dependent sidebar controls.
@@ -5919,6 +6663,7 @@ class PyQtAnnotationReview(QMainWindow):
         """
         is_annotation = self.mode == "annotation"
         has_project = self.project is not None
+        new_annotation = is_annotation and not self._legacy_mode
         # In a project both modes review the same per-level data, so the L1/L2/L3
         # selector is shown for validation too (it picks which level to review).
         self.level_selector_widget.setVisible(is_annotation or has_project)
@@ -5926,6 +6671,10 @@ class PyQtAnnotationReview(QMainWindow):
         # whenever the pen is up (validation, or annotate with no/edit mode).
         self._update_class_action_visibility()
         self.draw_button.setVisible(is_annotation)
+        # The Edit-objects button is only shown where editing is a manual toggle:
+        # validation (on a project) and legacy annotation. In the new annotation model
+        # editing is always on (implied by the pen being up), so the button is hidden.
+        self.edit_objects_button.setVisible((is_annotation or has_project) and not new_annotation)
         # Whole-object select+delete works in both project modes (validation
         # reviewers remove wrong objects too); gated to projects so the dormant
         # legacy non-project validation path is left untouched.
@@ -5933,7 +6682,56 @@ class PyQtAnnotationReview(QMainWindow):
         self.delete_button.setVisible(select_and_delete)
         # "Save all" writes all three level files; useful in either project mode.
         self.save_all_button.setVisible(is_annotation or has_project)
-        self.canvas.set_select_enabled(select_and_delete)
+        self._update_select_enabled()
+        self._sync_edit_enabled()
+
+    def _persist_setting(self, key: str, value) -> None:
+        """Update one user setting in the in-memory dict and write settings.json."""
+        self._settings[key] = value
+        save_app_settings(self._settings)
+
+    def _on_legacy_mode_toggled(self, checked: bool) -> None:
+        """Switch the annotation workflow structure (persisted). Off = new single-Draw
+        model (edit always on); On = legacy two-button Draw + Edit."""
+        self._legacy_mode = checked
+        self._persist_setting("legacy_draw_edit", checked)
+        # Reset both tool toggles to a clean state, then re-apply the chrome so the
+        # right buttons show and the canvas edit/select state matches the structure.
+        self.draw_button.blockSignals(True)
+        self.draw_button.setChecked(False)
+        self.draw_button.blockSignals(False)
+        self.edit_objects_button.blockSignals(True)
+        self.edit_objects_button.setChecked(False)
+        self.edit_objects_button.blockSignals(False)
+        self.canvas.set_draw_shape(None)
+        self.canvas.clear_selection()
+        self._apply_mode_chrome()
+        self._sync_draw_state()
+        if self.mode == "annotation":
+            self._populate_level_classes()
+        self._on_selection_changed()
+        self._update_status_labels()
+
+    def _editing_active(self) -> bool:
+        """Whether object editing (handles, move, delete, reclass, copy/paste) is on now.
+
+        New annotation model: editing is on whenever the Draw pen is UP. Validation and
+        legacy annotation: driven by the manual Edit-objects toggle."""
+        if self.mode == "annotation" and not self._legacy_mode:
+            return not self.draw_button.isChecked()
+        return self.edit_objects_button.isChecked()
+
+    def _sync_edit_enabled(self) -> None:
+        """Push the current editing-active state onto the canvas (handle dragging)."""
+        self.canvas.set_edit_enabled(self._editing_active())
+
+    def _update_select_enabled(self) -> None:
+        """Whole-object selection is on in either project mode — but NEVER while the
+        Draw pen is armed: in draw mode clicks place points, so objects can't be
+        selected (and switching to Draw clears any current selection)."""
+        can_select = (self.mode == "annotation" or self.project is not None) and not self.draw_button.isChecked()
+        self.canvas.set_select_enabled(can_select)
+        self.canvas.set_draw_active(self.draw_button.isChecked())
 
     def _set_mode(self, mode: str) -> None:
         """Switch between validation (review) and annotation (draw); each keeps its own session."""
@@ -5969,20 +6767,50 @@ class PyQtAnnotationReview(QMainWindow):
         self._update_action_buttons()
         self._update_status_labels()
 
+    def _on_level_button_clicked(self, level: int) -> None:
+        """Level button click. Plain click activates that single level; Shift+click
+        toggles it as a read-only overlay on top of the active level (view several at
+        once). Modifiers aren't delivered by ``clicked``, so read them live."""
+        shift = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if shift and level != self.annotation_level:
+            if level in self._extra_overlay_levels:
+                self._extra_overlay_levels.discard(level)
+            else:
+                self._extra_overlay_levels.add(level)
+            self._refresh_level_button_states()
+            self._refresh_overlay_items()
+        else:
+            # Plain click (or Shift on the active level): collapse back to one level.
+            self._set_level(level)
+
+    def _refresh_level_button_states(self) -> None:
+        """Sync the L1/L2/L3 buttons to the display set: the active level is the bright
+        'primary'; Shift+added levels are checked too but styled dimmer ('secondary')."""
+        for level_id, button in self.level_buttons.items():
+            is_primary = level_id == self.annotation_level
+            shown = is_primary or level_id in self._extra_overlay_levels
+            if button.isChecked() != shown:
+                button.setChecked(shown)
+            secondary = shown and not is_primary
+            if bool(button.property("secondaryLevel")) != secondary:
+                button.setProperty("secondaryLevel", secondary)
+                button.style().unpolish(button)
+                button.style().polish(button)
+
     def _set_level(self, level: int) -> None:
         """Choose the active annotation level and show its class list."""
         if level not in levels.LEVELS:
             return
         self.annotation_level = level
+        # A plain level switch collapses back to a single level (drops any overlays).
+        self._extra_overlay_levels.clear()
         # The active level's objects differ, so reset per-object rollout state.
         self._hidden_objects.clear()
         self._expanded_classes.clear()
         # Class visibility is per level too (category ids are reused across levels for
         # different classes), so start each level with every class visible.
         self.visible_by_category = {}
-        button = self.level_buttons.get(level)
-        if button is not None and not button.isChecked():
-            button.setChecked(True)
+        self._refresh_level_button_states()
         if self.mode == "annotation":
             self.canvas.clear_selection()
             self._populate_level_classes()
@@ -6014,10 +6842,19 @@ class PyQtAnnotationReview(QMainWindow):
             self.draw_button.setChecked(not self.draw_button.isChecked())
 
     def _toggle_edit_shortcut(self) -> None:
-        """Toggle 'Edit objects' (the T button). Editing is available in annotation
-        mode and in validation on a project — same gate as the on-screen button."""
+        """Toggle 'Edit objects'. Editing is available in annotation mode and in
+        validation on a project — same gate as the on-screen button."""
         if self.mode == "annotation" or self.project is not None:
             self.edit_objects_button.setChecked(not self.edit_objects_button.isChecked())
+
+    def _toggle_tool_shortcut(self) -> None:
+        """The single mode-aware tool toggle: in annotation it flips Draw (editing is
+        always on in the new model, or the separate Edit button handles it in legacy);
+        in validation it flips Edit objects."""
+        if self.mode == "annotation":
+            self._toggle_draw_shortcut()
+        else:
+            self._toggle_edit_shortcut()
 
     def _open_shortcut(self) -> None:
         # With a project open, "O" imports images; otherwise it opens a project.
@@ -6261,6 +7098,13 @@ class PyQtAnnotationReview(QMainWindow):
         self.canvas.show_points = self.show_points
         self.canvas.show_labels = self.show_labels
         self.canvas.annotation_opacity = self.opacity_slider.value() / 100.0
+        self.canvas.label_scale = self.label_scale
+
+    def _apply_label_scale(self, scale: float) -> None:
+        """Live-apply the on-canvas label size multiplier (persisted separately)."""
+        self.label_scale = max(0.5, min(2.0, float(scale)))
+        self._sync_canvas_state()
+        self.canvas.update()
 
     def _next_image(self) -> None:
         if not self.images:
@@ -6295,9 +7139,61 @@ class PyQtAnnotationReview(QMainWindow):
         self._update_status_labels()
 
     def _show_help(self) -> None:
-        """Show the dark-themed shortcuts window (with inline rebinding)."""
-        dialog = ShortcutsDialog(self)
+        """Open Settings on the Shortcuts tab (the status-bar '⌨ Shortcuts' button)."""
+        SettingsDialog(self, initial_tab="shortcuts").exec()
+
+    def _show_settings(self) -> None:
+        """Open Settings on the General tab (the top-bar 'Settings' entry)."""
+        SettingsDialog(self, initial_tab="general").exec()
+
+    def _open_import_window(self) -> None:
+        """Top-bar 'Import': pick images / LS zip / annotation JSONs. The window closes
+        before the chosen native picker opens (one action per visit)."""
+        if self.project is None:
+            return
+        has_images = bool(self.project.registry_images())
+        actions = [
+            ("images", "Open images folder",
+             "Add a folder of images to annotate — the usual way to start new annotations.", True),
+            ("zip", "Open zip from LS",
+             "Import a Label Studio export zip (images + annotation JSONs in one archive).", True),
+            ("annotations", "Open annotations (JSON)",
+             "Import annotation JSON file(s) onto the current images."
+             + ("" if has_images else "  Add images first."), has_images),
+        ]
+        dialog = ActionPickerDialog(self, "Import", actions)
         dialog.exec()
+        handler = {
+            "images": self._import_image_folder,
+            "zip": self._import_zip,
+            "annotations": self._import_annotations,
+        }.get(dialog.chosen)
+        if handler is not None:
+            handler()
+
+    def _open_project_window(self) -> None:
+        """Top-bar 'Project': the project actions as a window (matching Import/Settings)."""
+        has_project = self.project is not None
+        actions = [
+            ("new", "New project…", "Create a new, empty project folder.", True),
+            ("open", "Open project…", "Open an existing project folder.", True),
+            ("close", "Close project", "Close the current project.", has_project),
+            ("export", "Export as zip…", "Bundle the whole project into one shareable zip.", has_project),
+            ("redefine", "Redefine classes…",
+             "Assign imported off-catalog classes to a level + existing class.",
+             self.action_redefine.isEnabled()),
+        ]
+        dialog = ActionPickerDialog(self, "Project", actions)
+        dialog.exec()
+        handler = {
+            "new": self._new_project,
+            "open": self._open_project,
+            "close": self._close_project,
+            "export": self._export_project_zip,
+            "redefine": self._open_redefine_dialog,
+        }.get(dialog.chosen)
+        if handler is not None:
+            handler()
 
     def _toggle_class_popout(self) -> None:
         """Detach the class list into a resizable window (or dock it back)."""
@@ -6369,25 +7265,34 @@ class PyQtAnnotationReview(QMainWindow):
         "PROJECTS\n"
         "• Project ▸ New / Open creates or opens a self-contained project folder\n"
         "  (images + annotations/level1‑3.json). Everything lives there.\n"
-        "• Import ▸ Open zip / image folder / annotations adds data. Images are\n"
-        "  de-duplicated; annotations are sorted into the 3 levels by class name.\n"
+        "• Import (top bar) ▸ images folder / zip from LS / annotations JSON adds data.\n"
+        "  Images are de-duplicated; annotations are sorted into the 3 levels by class.\n"
         "• Project ▸ Export as zip… bundles the whole project to share.\n\n"
         "LEVELS  (L1 surfaces · L2 objects/boxes · L3 details)\n"
         "• The L1/L2/L3 selector picks which level you review or draw. L1 & L3 are\n"
-        "  polygons; L2 is (optionally rotated) boxes.\n\n"
+        "  polygons; L2 is (optionally rotated) boxes.\n"
+        "• Shift+click a level to overlay its objects (read-only) on top of the current\n"
+        "  level — stack as many as you like to view several levels at once. A plain\n"
+        "  click clears the overlays and returns to just that one level.\n\n"
         "MODES\n"
         "• Validation — review existing annotations; the class list shows only the\n"
         "  classes present on the current image (toggle visibility, Show/Hide all).\n"
-        "• Annotate — draw new objects with the Draw tool (D). Both modes share the\n"
-        "  same per-level data and save the same level files.\n\n"
+        "  Turn on Edit objects to fix/delete them.\n"
+        "• Annotate — editing is ALWAYS on (select, move, reshape, delete, copy) and the\n"
+        "  Draw button just arms the pen to add new objects on top; drop the pen to edit\n"
+        "  again. (Settings ▸ General ▸ Legacy draw/edit mode brings back the old\n"
+        "  separate Draw + Edit buttons.) Both modes share the same per-level data.\n\n"
         "EDITING\n"
-        "• Edit objects (T): select an object first — only the SELECTED object shows\n"
+        "• Select an object — only the SELECTED object shows\n"
         "  its handles. Drag a corner/vertex to move it. On polygons, click a vertex\n"
-        "  then Delete to remove it, or right-click an edge to add one. Drag an L2 box\n"
-        "  body to move it whole, or its round handle to rotate it.\n"
+        "  then Delete to remove it, or right-click an edge to add one. Drag the body\n"
+        "  of the selected object (an L2 box, or an L1/L3 polygon) to move it whole; an\n"
+        "  L2 box's round handle rotates it.\n"
         "• While drawing: click to place points, drag a point to move it, right-click\n"
         "  to insert, Enter (or click the first point) to finish, Esc to cancel.\n"
         "• Select an object to change its class (sidebar catalog) or delete it (Del).\n"
+        "  Copy it with Ctrl+C and paste a duplicate with Ctrl+V — the copy drops under\n"
+        "  the cursor, nudged aside if it would overlap so it's never a hidden duplicate.\n"
         "  Edits are undoable (Ctrl+Z / Ctrl+Y) and saved per level (Ctrl+S / Save all).\n\n"
         "REDEFINE\n"
         "• Imported classes not in the catalog are parked (dashed magenta) and shown\n"
@@ -6403,26 +7308,35 @@ class PyQtAnnotationReview(QMainWindow):
         "PROJEKTY\n"
         "• Project ▸ New / Open vytvoří nebo otevře samostatnou složku projektu\n"
         "  (obrázky + annotations/level1‑3.json). Vše je uloženo zde.\n"
-        "• Import ▸ Open zip / image folder / annotations přidá data. Obrázky se\n"
-        "  deduplikují; anotace se třídí do 3 úrovní podle názvu třídy.\n"
+        "• Import (horní lišta) ▸ složka obrázků / zip z LS / anotace JSON přidá data.\n"
+        "  Obrázky se deduplikují; anotace se třídí do 3 úrovní podle názvu třídy.\n"
         "• Project ▸ Export as zip… zabalí celý projekt ke sdílení.\n\n"
         "ÚROVNĚ  (L1 povrchy · L2 objekty/boxy · L3 detaily)\n"
         "• Přepínač L1/L2/L3 určuje, kterou úroveň prohlížíte nebo kreslíte. L1 a L3\n"
-        "  jsou polygony; L2 jsou (volitelně otočené) boxy.\n\n"
+        "  jsou polygony; L2 jsou (volitelně otočené) boxy.\n"
+        "• Shift+klik na úroveň navrství její objekty (jen ke čtení) přes aktuální\n"
+        "  úroveň — takto lze zobrazit více úrovní najednou. Běžný klik navrstvení\n"
+        "  zruší a vrátí se jen k této jedné úrovni.\n\n"
         "REŽIMY\n"
         "• Validation — kontrola existujících anotací; seznam tříd ukazuje pouze třídy\n"
         "  přítomné na aktuálním obrázku (přepínání viditelnosti, Show/Hide all).\n"
-        "• Annotate — kreslení nových objektů nástrojem Draw (D). Oba režimy sdílejí\n"
-        "  stejná data podle úrovní a ukládají stejné soubory úrovní.\n\n"
+        "  Pro opravu/smazání zapněte Edit objects.\n"
+        "• Annotate — úpravy jsou VŽDY zapnuté (výběr, posun, změna tvaru, mazání,\n"
+        "  kopírování) a tlačítko Draw jen aktivuje pero pro kreslení nových objektů;\n"
+        "  zvednutím pera se vrátíte k úpravám. (Settings ▸ General ▸ Legacy draw/edit\n"
+        "  mode vrátí původní tlačítka Draw + Edit.) Oba režimy sdílejí stejná data.\n\n"
         "ÚPRAVY\n"
-        "• Edit objects (T): nejprve vyberte objekt — úchyty zobrazuje pouze VYBRANÝ\n"
+        "• Vyberte objekt — úchyty zobrazuje pouze VYBRANÝ\n"
         "  objekt. Tažením rohu/vrcholu jej posunete. U polygonů klikněte na vrchol a\n"
         "  klávesou Delete jej odeberete, nebo pravým tlačítkem na hranu přidáte nový.\n"
-        "  Tažením těla L2 boxu jej posunete celý, kulatým úchytem jej otočíte.\n"
+        "  Tažením těla vybraného objektu (L2 boxu nebo L1/L3 polygonu) jej posunete\n"
+        "  celý; kulatým úchytem L2 box otočíte.\n"
         "• Při kreslení: klikáním umísťujete body, tažením bodu jej posunete, pravým\n"
         "  tlačítkem vložíte bod, Enter (nebo klik na první bod) dokončí, Esc zruší.\n"
         "• Vyberte objekt pro změnu jeho třídy (katalog v postranním panelu) nebo jeho\n"
-        "  smazání (Del). Úpravy lze vrátit zpět (Ctrl+Z / Ctrl+Y) a ukládají se po\n"
+        "  smazání (Del). Zkopírujte jej Ctrl+C a vložte duplikát Ctrl+V — kopie se\n"
+        "  vloží pod kurzor, odsazená, pokud by se překrývala, aby nebyla skrytá.\n"
+        "  Úpravy lze vrátit zpět (Ctrl+Z / Ctrl+Y) a ukládají se po\n"
         "  úrovních (Ctrl+S / Save all).\n\n"
         "REDEFINICE\n"
         "• Importované třídy, které nejsou v katalogu, se odloží (čárkovaně purpurově)\n"
@@ -6623,6 +7537,32 @@ class PyQtAnnotationReview(QMainWindow):
             })
         return overlays
 
+    def _extra_level_overlays(self) -> list[dict]:
+        """Read-only overlays for levels layered via Shift+click (view multiple levels).
+
+        These come from other levels' stores, so they're rendered NON-editable and
+        NON-selectable (``annotation`` cleared): the active level stays the only one
+        you can edit/select. Per-class visibility toggles don't apply — category ids
+        are reused across levels — so every object on an added level is shown."""
+        if not self._extra_overlay_levels:
+            return []
+        basename = self._current_image_basename()
+        if not basename:
+            return []
+        extras: list[dict] = []
+        for level in sorted(self._extra_overlay_levels):
+            if level == self.annotation_level:
+                continue
+            annotations = self.annotation_store[level].get(basename, [])
+            for item in self._build_annotation_overlay_items(annotations, level, respect_visibility=False):
+                item["annotation"] = None      # view-only: not selectable
+                item["editable"] = False
+                item["rotatable"] = False
+                item["vertex_editable"] = False
+                item["secondary_level"] = level
+                extras.append(item)
+        return extras
+
     def _refresh_overlay_items(self) -> None:
         if self.mode == "annotation":
             annotations = self._current_level_annotations()
@@ -6631,6 +7571,7 @@ class PyQtAnnotationReview(QMainWindow):
             # (no/edit mode) the class pills hide/show classes, like validation.
             overlays = self._build_annotation_overlay_items(annotations, self.annotation_level, respect_visibility=True)
             overlays += self._pending_redefine_overlays(self.annotation_level)
+            overlays += self._extra_level_overlays()
             self.current_overlay_items = overlays
             self.canvas.set_overlay_items(self.current_overlay_items)
             self.canvas.update()
@@ -6643,6 +7584,7 @@ class PyQtAnnotationReview(QMainWindow):
         self.current_annotations = annotations
         overlays = self._build_annotation_overlay_items(annotations, self.annotation_level, respect_visibility=True)
         overlays += self._pending_redefine_overlays(self.annotation_level)
+        overlays += self._extra_level_overlays()
         self.current_overlay_items = overlays
         self.canvas.set_overlay_items(self.current_overlay_items)
         self.canvas.update()
@@ -6767,6 +7709,128 @@ class PyQtAnnotationReview(QMainWindow):
         self._update_action_buttons()
         self._update_status_labels()
 
+    # ----- copy / paste an object -----------------------------------------
+    def _annotation_center(self, annotation: dict) -> tuple[float, float] | None:
+        """The centre of an annotation's geometry bounding box, or None if it has none."""
+        points = self._raw_geometry_points(annotation)
+        if not points:
+            return None
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+    @staticmethod
+    def _translate_annotation(annotation: dict, dx: float, dy: float) -> None:
+        """Shift an annotation's geometry by (dx, dy) in image space, in place.
+
+        Moves every segmentation coordinate and the bbox origin; area and rotation are
+        translation-invariant, so they're left as-is."""
+        segmentation = annotation.get("segmentation")
+        if isinstance(segmentation, list):
+            for k, contour in enumerate(segmentation):
+                if isinstance(contour, list):
+                    segmentation[k] = [
+                        coord + (dx if i % 2 == 0 else dy) for i, coord in enumerate(contour)
+                    ]
+        bbox = annotation.get("bbox")
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            bbox[0] = bbox[0] + dx
+            bbox[1] = bbox[1] + dy
+
+    def _copy_paste_active(self) -> bool:
+        """Copy/paste only work while editing is active (Edit-objects toggle, or the
+        new model's pen-up state)."""
+        return self._editing_active()
+
+    def _copy_selected_annotation(self) -> None:
+        """Ctrl+C: stash a deep copy of the selected object (on its level) for pasting."""
+        if not self._copy_paste_active():
+            return
+        annotation = self.canvas.selected_annotation()
+        if annotation is None:
+            return
+        self._clipboard = {"level": self.annotation_level, "annotation": copy.deepcopy(annotation)}
+        self._update_status_labels()
+
+    def _paste_annotation(self) -> None:
+        """Ctrl+V: drop a copy of the clipboard object under the cursor (its own level).
+
+        Positions the copy's centre at the pointer; if that would land it (almost)
+        on top of an existing object — e.g. the cursor never moved between copy and
+        paste — it's nudged aside so the duplicate is obviously separate. The paste is
+        clamped inside the image, selected, and undoable like any other new object.
+        """
+        if self._clipboard is None:
+            return
+        if not self._copy_paste_active():
+            return
+        if self.mode != "annotation" and self.project is None:
+            return
+        if not self._current_image_basename():
+            return
+        level = self._clipboard["level"]
+        # A copy only fits the geometry/classes of its own level, so paste there —
+        # switching the active level to it (in view) when needed.
+        if self.annotation_level != level:
+            self._set_level(level)
+        new_annotation = copy.deepcopy(self._clipboard["annotation"])
+        points = self._raw_geometry_points(new_annotation)
+        if not points:
+            return
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        center_x, center_y = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+        width, height = max_x - min_x, max_y - min_y
+
+        annotations = self._current_level_annotations()
+        existing_centers = [c for c in (self._annotation_center(a) for a in annotations) if c is not None]
+
+        target = self.canvas.cursor_image_pos()
+        if target is not None:
+            dx, dy = target[0] - center_x, target[1] - center_y
+        else:
+            dx, dy = 0.0, 0.0
+
+        bounds = self.canvas._image_bounds()
+        # Nudge the copy off any object it would land (almost) on top of — the source
+        # when the cursor didn't move, or an earlier paste when repeating — so a copy is
+        # always visibly separate and we never make an invisible exact duplicate. Step
+        # toward whichever side has room so it can't just clamp back onto the original.
+        close = max(4.0, 0.15 * min(width, height)) if min(width, height) > 0 else 6.0
+        nudge = max(10.0, 0.35 * max(width, height))
+        step_x = nudge if (bounds is None or max_x + nudge <= bounds[0]) else -nudge
+        step_y = nudge if (bounds is None or max_y + nudge <= bounds[1]) else -nudge
+        for _ in range(64):  # capped so a fully-boxed-in image can't loop forever
+            cx, cy = center_x + dx, center_y + dy
+            if not any(math.hypot(cx - ex, cy - ey) < close for ex, ey in existing_centers):
+                break
+            dx += step_x
+            dy += step_y
+
+        # Keep the whole pasted object inside the image (slide, don't overrun).
+        if bounds is not None:
+            bw, bh = bounds
+            dx = max(-min_x, min(dx, bw - max_x))
+            dy = max(-min_y, min(dy, bh - max_y))
+
+        self._translate_annotation(new_annotation, dx, dy)
+        annotations.append(new_annotation)
+        record = {
+            "kind": "create",
+            "level": level,
+            "basename": self._current_image_basename(),
+            "annotation": new_annotation,
+            "image_index": self.index,
+        }
+        self._undo_stack.append(record)
+        self._redo_stack.clear()
+        self._mark_dirty_level(level)
+        self._refresh_overlay_items()
+        self.canvas._set_selected(new_annotation)  # select the paste: obvious + ready to nudge
+        self._update_action_buttons()
+        self._update_status_labels()
+
     def _on_selection_changed(self) -> None:
         # Selecting a parked-redefine object still swaps the sidebar to the
         # "assign a class" catalog (that's how you resolve it — unaffected by Edit).
@@ -6777,7 +7841,7 @@ class PyQtAnnotationReview(QMainWindow):
             return
         annotation = self.canvas.selected_annotation()
         can_edit = self.mode == "annotation" or self.project is not None
-        edit_on = self.edit_objects_button.isChecked()
+        edit_on = self._editing_active()
         # Changing class / deleting an object is gated behind Edit mode. ONLY in
         # Edit mode does selecting swap to the "change class" panel + enable Delete.
         if annotation is not None and can_edit and edit_on:
@@ -6949,7 +8013,7 @@ class PyQtAnnotationReview(QMainWindow):
         """
         if self.mode != "annotation" and self.project is None:
             return False
-        if not self.edit_objects_button.isChecked():
+        if not self._editing_active():
             return False
         annotation = self.canvas.selected_annotation()
         if annotation is None:
@@ -7351,6 +8415,15 @@ class PyQtAnnotationReview(QMainWindow):
                 self.canvas.finish_polygon()
                 event.accept()
                 return
+            # Undo (Ctrl+Z) while drawing removes the last placed point instead of
+            # undoing a committed object. In-progress points never enter the undo
+            # stack, so once the object is finished Ctrl+Z resumes at the last real
+            # change — you can no longer step back the individual points.
+            draw_seq = QKeySequence(event.keyCombination()).toString()
+            if self._shortcut_index.get(draw_seq) == "undo":
+                if self.canvas.remove_last_point_any():
+                    event.accept()
+                    return
             if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
                 # A selected pending point is removed first; plain Backspace otherwise
                 # drops the last-placed point (the long-standing behaviour).

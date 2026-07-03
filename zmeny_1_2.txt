@@ -1,0 +1,17 @@
+- pomocí shift click přidání dalšího levelu do stávajícího (zobrazení více levelů najednou)
+- přidání clickable labelů (po kliknutí na label se také označí objekt ke kterému patří)
+- přidané slabé označní objektu po přejetí kurzorem
+- přidané show all hide all tlačítka do "draw" módu
+- ctrl + z funguje i na body při anotaci (při kreslení objektu)
+- vyřešen bug s orientovanými boxy přesahujícími přes okraj
+
+- přidáno ctrl+c ctrl+v (pouze v edit modu)
+
+
+v annotate edit mode porad zaplej a toggle je jen na draw -> pozor na shortcuts
+
+velikost labelů slider v nastavení
+
+přidaný okna settings, import, project
+
+změna image listu vzhled
