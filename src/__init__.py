@@ -1,3 +1,3 @@
-"""Annotation Review - COCO annotation viewer."""
+"""DFET Annotation tool."""
 
 __version__ = "1.0.0"

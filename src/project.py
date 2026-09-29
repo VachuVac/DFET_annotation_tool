@@ -1,4 +1,4 @@
-"""Project model for the Annotation Workbench.
+"""Project model for the DFET Annotation tool.
 
 A *project* is a self-contained, portable folder that is the shared working
 area for both validation and annotation modes. It copies images into itself and

@@ -17,7 +17,17 @@ import sys
 import time
 from pathlib import Path
 
-from .constants import APP_NAME, APP_VERSION, DPI_SCALE, MONITOR_HEIGHT, MONITOR_WIDTH, SIDEBAR_WIDTH
+from .constants import (
+    APP_NAME,
+    APP_VERSION,
+    DATA_DIR_NAME,
+    DPI_SCALE,
+    LEGACY_DATA_DIR_NAME,
+    LEGACY_DOCS_DIR_NAME,
+    MONITOR_HEIGHT,
+    MONITOR_WIDTH,
+    SIDEBAR_WIDTH,
+)
 from .data_loading import (
     discover_images_dir,
     load_coco_data,
@@ -171,23 +181,58 @@ def _image_code_cmp(a: str, b: str) -> int:
 
 
 def _legacy_user_data_dir() -> Path:
-    """The OLD frozen config location (``Documents/<APP_NAME>``). Kept ONLY as a
-    one-time migration source — configs now live in the local app folder below. Not
-    created here; we only read from it if it already exists."""
+    """The OLDEST frozen config location (``Documents/Annotation Workbench``). Kept ONLY
+    as a one-time migration source — configs now live in the local app folder below.
+    Not created here; we only read from it if it already exists."""
     docs = Path.home() / "Documents"
     base = docs if docs.is_dir() else Path.home()
-    return base / APP_NAME
+    return base / LEGACY_DOCS_DIR_NAME
+
+
+def _legacy_local_data_dir() -> Path:
+    """The pre-rename local app folder (``%LOCALAPPDATA%/AnnotationWorkbench``). Moved
+    into the new folder on first run by ``_move_legacy_local_dir``; never created."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    return (Path(base) / LEGACY_DATA_DIR_NAME) if base else (Path.home() / f".{LEGACY_DATA_DIR_NAME.lower()}")
+
+
+def _merge_move(src: Path, dest: Path) -> None:
+    """Move everything in ``src`` into ``dest`` without overwriting anything already in
+    ``dest``; sub-folders present on both sides are merged. ``src`` is removed once it
+    is empty. Best-effort: an entry that can't be moved is left where it is."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in list(src.iterdir()):
+        target = dest / entry.name
+        try:
+            if entry.is_dir() and target.is_dir():
+                _merge_move(entry, target)
+            elif not target.exists():
+                shutil.move(str(entry), str(target))
+        except Exception:
+            pass
+    try:
+        src.rmdir()  # only succeeds when everything was moved out
+    except OSError:
+        pass
+
+
+def _move_legacy_local_dir() -> None:
+    """One-time rename of the pre-rename local folder (configs + logs) to the new
+    ``DATA_DIR_NAME`` folder, so users keep their settings and the old name disappears."""
+    old = _legacy_local_data_dir()
+    if old.is_dir():
+        _merge_move(old, _local_data_dir())
 
 
 def _local_data_dir() -> Path:
     """Folder for ALL of the user's editable config (class colours, shortcuts,
-    settings). Lives under ``%LOCALAPPDATA%/AnnotationWorkbench`` — the same app folder
+    settings). Lives under ``%LOCALAPPDATA%/DFETAnnotationTool`` — the same app folder
     the session logs use — so the app keeps one tidy local home instead of littering
     Documents or the exe's own directory. Falls back to a home dotfolder if
     LOCALAPPDATA is unavailable. Only used by the frozen build; source/test runs keep
     their configs next to the package."""
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-    root = (Path(base) / "AnnotationWorkbench") if base else (Path.home() / ".annotationworkbench")
+    root = (Path(base) / DATA_DIR_NAME) if base else (Path.home() / f".{DATA_DIR_NAME.lower()}")
     try:
         root.mkdir(parents=True, exist_ok=True)
         return root
@@ -221,19 +266,22 @@ def _load_color_config() -> dict[str, str]:
 
 def _ensure_user_config_files() -> None:
     """Frozen first-run: make sure the user's editable configs live in the local app
-    folder (%LOCALAPPDATA%/AnnotationWorkbench), NOT next to the exe or in Documents.
+    folder (%LOCALAPPDATA%/DFETAnnotationTool), NOT next to the exe or in Documents.
 
     Colour configs are seeded from the bundled copies; any config the user already
-    customised in an OLDER location (next to the exe, or the previous Documents/<APP>
-    home) is copied over so customisations carry forward. The old files are LEFT in
-    place — we just stop reading them. ``shortcuts.json`` / ``settings.json`` have no
-    bundled default, so they're migrate-only."""
+    customised in an OLDER location is carried forward: the pre-rename
+    %LOCALAPPDATA%/AnnotationWorkbench folder is MOVED into the new one (then removed),
+    and anything still missing is copied from the Documents/Annotation Workbench home
+    or from next to the exe (those old files are LEFT in place). ``shortcuts.json`` /
+    ``settings.json`` have no bundled default, so they're migrate-only."""
     if not getattr(sys, "frozen", False):
         return
+    _move_legacy_local_dir()
     data_dir = _local_data_dir()
     meipass = Path(sys._MEIPASS)
     exe_dir = Path(sys.executable).parent
-    old_docs_dir = _legacy_user_data_dir()  # the previous frozen home (Documents/<APP>)
+    old_local_dir = _legacy_local_data_dir()  # pre-rename local app folder
+    old_docs_dir = _legacy_user_data_dir()  # the older frozen home (Documents/<APP>)
     seeds = {
         "class_colors.json": meipass / "class_colors.json",
         "class_colors_default.json": meipass / "class_colors_default.json",
@@ -255,9 +303,11 @@ def _ensure_user_config_files() -> None:
             continue
         if dest.exists():
             continue
-        # Prefer a file the user already customised: previous Documents home first,
-        # then the even-older exe-adjacent layout, then the bundled default.
-        for candidate in (old_docs_dir / filename, exe_dir / filename, bundled):
+        # Prefer a file the user already customised: pre-rename local folder first (only
+        # if the move above left it behind), then the Documents home, then the
+        # exe-adjacent layout, then the bundled default.
+        candidates = (old_local_dir / filename, old_docs_dir / filename, exe_dir / filename, bundled)
+        for candidate in candidates:
             if candidate is not None and candidate.exists():
                 try:
                     shutil.copy2(candidate, dest)
@@ -306,7 +356,7 @@ _migrate_superseded_default_colors()
 def _shortcut_config_path() -> Path:
     """User-editable keyboard shortcut overrides.
 
-    Frozen: in the local app folder (%LOCALAPPDATA%/AnnotationWorkbench). Source/test:
+    Frozen: in the local app folder (%LOCALAPPDATA%/DFETAnnotationTool). Source/test:
     next to the package."""
     if getattr(sys, "frozen", False):
         return _local_data_dir() / "shortcuts.json"
@@ -424,7 +474,7 @@ class ImageCanvas(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._pixmap: QPixmap | None = None
-        self._title = "Annotation Workbench"
+        self._title = APP_NAME
         self._zoom = 1.0
         self._offset = QPoint(0, 0)
         self._dragging = False
@@ -517,7 +567,7 @@ class ImageCanvas(QWidget):
     def has_image(self) -> bool:
         return self._pixmap is not None
 
-    def set_idle(self, title: str = "Annotation Workbench") -> None:
+    def set_idle(self, title: str = APP_NAME) -> None:
         self._pixmap = None
         self._overlay_items = []
         self._title = title
@@ -4527,7 +4577,7 @@ class PyQtAnnotationReview(QMainWindow):
 
         # Title row is the header alone now — the image badge used to sit here and
         # clipped beside the long title, so it moved down to the project row below.
-        header = QLabel("Annotation Workbench")
+        header = QLabel(APP_NAME)
         header.setObjectName("header")
         sidebar_layout.addWidget(header)
 
@@ -4982,7 +5032,7 @@ class PyQtAnnotationReview(QMainWindow):
         column = QVBoxLayout()
         column.setSpacing(14)
 
-        title = QLabel(f"Annotation Workbench  ·  v{APP_VERSION}")
+        title = QLabel(f"{APP_NAME}  ·  v{APP_VERSION}")
         title.setObjectName("header")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         column.addWidget(title)
@@ -6336,7 +6386,7 @@ class PyQtAnnotationReview(QMainWindow):
         for category_id in self.current_category_ids:
             self.visible_by_category.setdefault(category_id, True)
 
-    def _show_message(self, text: str, title: str = "Annotation Workbench") -> None:
+    def _show_message(self, text: str, title: str = APP_NAME) -> None:
         message_box = QMessageBox(self)
         message_box.setIcon(QMessageBox.Icon.NoIcon)
         message_box.setWindowTitle(title)
@@ -8471,7 +8521,7 @@ class PyQtAnnotationReview(QMainWindow):
 
 
 def main() -> None:
-    """Run the PyQt annotation review application."""
+    """Run the DFET Annotation tool."""
     args = parse_arguments()
 
     if args.self_test:
@@ -8487,7 +8537,7 @@ def main() -> None:
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Annotation Workbench")
+    app.setApplicationName(APP_NAME)
     app.setWindowIcon(QIcon(str(resource_path("assets", "app_icon.png"))))
     app.setStyle("Fusion")
 

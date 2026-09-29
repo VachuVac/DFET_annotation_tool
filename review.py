@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
-"""Annotation Review - COCO annotation viewer wrapper.
+"""DFET Annotation tool - entry point.
 
-This module serves as the entry point for the Annotation Review application.
+This module serves as the entry point for the DFET Annotation tool.
 It imports and calls the main application from the src package.
 """
 

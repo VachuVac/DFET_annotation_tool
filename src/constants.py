@@ -4,9 +4,14 @@ import ctypes
 import os
 
 
-# Application identity / version. Pinned at 1.0 for now; bump here when releasing.
-APP_NAME = "Annotation Workbench"
-APP_VERSION = "1.2"
+# Application identity / version. Reset to 1.0 with the rename (earlier internal builds were 1.1-1.2); bump here when releasing.
+APP_NAME = "DFET Annotation tool"
+# Per-user folder under %LOCALAPPDATA% for configs + session logs.
+DATA_DIR_NAME = "DFETAnnotationTool"
+# Pre-rename homes, read only as one-time migration sources for user configs.
+LEGACY_DATA_DIR_NAME = "AnnotationWorkbench"   # %LOCALAPPDATA%/<this>
+LEGACY_DOCS_DIR_NAME = "Annotation Workbench"  # Documents/<this>
+APP_VERSION = "1.0"
 
 
 def _detect_monitor_size() -> tuple[int, int]:

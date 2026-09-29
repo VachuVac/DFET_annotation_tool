@@ -20,7 +20,8 @@ import sys
 import traceback
 from pathlib import Path
 
-APP_NAME = "AnnotationWorkbench"
+from .constants import APP_NAME, DATA_DIR_NAME
+
 MAX_SESSIONS = 50
 
 _log_path: Path | None = None
@@ -55,7 +56,7 @@ class _Tee:
 def log_dir() -> Path:
     """The directory holding session logs (created if missing)."""
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-    root = (Path(base) / APP_NAME / "logs") if base else (Path.home() / f".{APP_NAME.lower()}" / "logs")
+    root = (Path(base) / DATA_DIR_NAME / "logs") if base else (Path.home() / f".{DATA_DIR_NAME.lower()}" / "logs")
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -87,7 +88,7 @@ def install() -> Path | None:
         return None  # never let logging setup break startup
 
     _log_path = path
-    handle.write(f"=== Annotation Workbench session {stamp} (pid {os.getpid()}) ===\n")
+    handle.write(f"=== {APP_NAME} session {stamp} (pid {os.getpid()}) ===\n")
     handle.flush()
 
     # Tee stdout/stderr to the log (keeping the real console too, if there is one).

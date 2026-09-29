@@ -26,7 +26,7 @@ def pick_input_path_from_dialog() -> str | None:
     return selected if selected else None
 
 
-def show_info_popup(message: str, title: str = "Annotation Review") -> None:
+def show_info_popup(message: str, title: str = "DFET Annotation tool") -> None:
     """Display info popup message."""
     try:
         import tkinter as tk

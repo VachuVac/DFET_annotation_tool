@@ -6,26 +6,36 @@ Concise, actionable guidance for coding agents working in this repository.
 
 What this app is
 ----------------
-**Annotation Workbench** — a PyQt6 desktop app for reviewing **and editing** COCO/Label-Studio
+**DFET Annotation tool** (formerly "Annotation Workbench") — a PyQt6 desktop app for reviewing **and editing** COCO/Label-Studio
 training-data annotations (a 2026 annotation-training workflow). It began as a COCO *viewer* and
 has grown into a full annotation **editor** organized around portable **projects** with 3 levels.
 It is no longer read-only.
 
-App version is **pinned at 1.0**: `APP_NAME` / `APP_VERSION` live in [src/constants.py](src/constants.py) and surface
-(display-only) in the window title, sidebar subtitle, welcome page, and the "How it works" help. Bump
-`APP_VERSION` there when releasing.
+`APP_NAME` / `APP_VERSION` live in [src/constants.py](src/constants.py) (single source of truth — the spec and
+build script read them too) and surface (display-only) in the window title, sidebar subtitle, welcome page,
+and the "How it works" help. Bump `APP_VERSION` there when releasing. The version was reset to **1.0** with
+the rename to DFET Annotation tool (earlier internal builds were 1.1–1.2).
+
+**Releasing a new version**: the exe is NOT committed (too big) — it's attached to a GitHub Release.
+After bumping `APP_VERSION` and rebuilding:
+1. Copy the exe to a name without spaces (GitHub turns spaces into dots), e.g. `DFET_Annotation_tool_<version>.exe`.
+2. `gh release create v<version> "<path to exe>" --title "DFET Annotation tool <version>"`.
+3. **Update [README.md](README.md)**: the download link (`releases/latest`) follows automatically, but the
+   exe filename written in "Download and run" still names the old version — change it.
 
 Quick entry points
 ------------------
-- **Run locally**: `python review.py` → [src/qt_main.py](src/qt_main.py) `main()`. Conda env `review` at
-  `<USER_HOME>\.conda\envs\review` has PyQt6 + numpy + cv2.
+- **Run locally**: `python review.py` → [src/qt_main.py](src/qt_main.py) `main()`. Conda env `review` has
+  PyQt6 + numpy + cv2.
 - **Build / bundle**: [build_review_app.ps1](build_review_app.ps1) (or [build_command.txt](build_command.txt)) runs
-  PyInstaller against [review_app.spec](review_app.spec). Output is a **single one-file** exe:
-  `dist/Annotation Workbench.exe` (windowed, no console; `name=` in the spec sets the exe name).
-  User-editable config (`class_colors*.json`, `shortcuts.json`) lives in **`Documents/Annotation Workbench/`**
-  (NOT next to the exe — keeps a desktop-placed exe tidy); seeded/migrated on first frozen run by
-  `_ensure_user_config_files()` via `_user_data_dir()`. Source/test runs keep these next to the package.
-  Session logs are separate, in `%LOCALAPPDATA%/Annotation Workbench/logs` (`applog.log_dir`).
+  PyInstaller against [review_app.spec](review_app.spec) using the active conda env (or `-Python <path>`).
+  Output is a **single one-file** exe: `dist/<APP_NAME> <APP_VERSION>.exe` (windowed, no console).
+  No machine-specific paths belong in the spec/script — conda DLLs are resolved from `sys.prefix`.
+  User-editable config (`class_colors*.json`, `shortcuts.json`, `settings.json`) lives in
+  **`%LOCALAPPDATA%/DFETAnnotationTool/`** (`constants.DATA_DIR_NAME`; NOT next to the exe); seeded/migrated on
+  first frozen run by `_ensure_user_config_files()`, which copies configs from the pre-rename homes
+  (`%LOCALAPPDATA%/AnnotationWorkbench`, `Documents/Annotation Workbench`). Source/test runs keep these next
+  to the package. Session logs go to `%LOCALAPPDATA%/DFETAnnotationTool/logs` (`applog.log_dir`).
 
 Architecture (key files)
 ------------------------

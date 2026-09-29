@@ -1,4 +1,4 @@
-"""Main application entry point for Annotation Review."""
+"""Main application entry point for DFET Annotation tool."""
 
 import os
 import cv2
@@ -17,7 +17,7 @@ def main() -> None:
         print("Self-test OK: arguments parsed, dependencies imported.")
         return
 
-    viewer = AnnotationViewer("Annotation Review")
+    viewer = AnnotationViewer("DFET Annotation tool")
 
     dataset = None
     temp_extraction = None

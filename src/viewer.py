@@ -91,7 +91,7 @@ class AnnotationViewer:
             self.reset_view()
         self.raise_window_requested = True
 
-    def set_idle_view(self, title: str = "Annotation Review") -> None:
+    def set_idle_view(self, title: str = "DFET Annotation tool") -> None:
         """Set idle view (no image)."""
         self.image = None
         self.title = title
@@ -525,7 +525,7 @@ class AnnotationViewer:
         self.points_hitbox = None
         self.labels_hitbox = None
 
-        draw_crisp_text(canvas, "Annotation Review", (panel_x + 16, 34), SIDEBAR_TEXT, 0.78, 1)
+        draw_crisp_text(canvas, "DFET Annotation tool", (panel_x + 16, 34), SIDEBAR_TEXT, 0.78, 1)
 
         message = "No dataset loaded"
         text_x = 24

@@ -2882,7 +2882,7 @@ def test_run_in_background_reports_worker_errors() -> None:
 
 
 def test_oriented_box_width_clamped_to_image_bounds() -> None:
-    # v1.2 fix: with p1->p2 along the top edge, dragging the thickness past the image
+    # With p1->p2 along the top edge, dragging the thickness past the image
     # height must stop AT the border. Without bounds the far corners escaped (the bug:
     # you could set the width through the border after clicking near the edge).
     p1, p2 = (10.0, 0.0), (40.0, 0.0)

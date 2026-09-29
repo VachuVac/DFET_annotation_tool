@@ -1,2 +1,3 @@
-cd <repo>
+conda activate review
 powershell -ExecutionPolicy Bypass -File .\build_review_app.ps1
+# or, without activating: .\build_review_app.ps1 -Python <path-to-env>\python.exe
